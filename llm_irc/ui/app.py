@@ -26,6 +26,7 @@ from ..llm.scheduler import Priority, Scheduler
 from ..store.db import Store
 from . import commands as c
 from .buffer import ChatBuffer
+from .help_view import HelpScreen
 from .profile_view import ProfileScreen
 
 STATUS_KEY = "\x00status"
@@ -46,7 +47,9 @@ class IRCApp(App):
     #statusline { height: 1; padding: 0 1; background: $primary-background;
                   color: $text-muted; }
     """
+    # Listed for users in commands.KEYS; update both together.
     BINDINGS = [
+        Binding("f1", "show_help", "Help", priority=True),
         Binding("ctrl+space,ctrl+@,f2", "suggest_now", "Suggest", priority=True),
         Binding("tab", "tab_key", "Use suggestion", show=False, priority=True),
         # F6-F8 too: some terminals (e.g. xterm.js-based panels) turn Alt+digit into
@@ -570,10 +573,9 @@ class IRCApp(App):
                     pane.write_info("Commands:", style="bold")
                     for text in c.HELP.values():
                         pane.write_info("  " + text, style="")
-                    pane.write_info("Keys: Ctrl+Space/F2 suggest · Tab, F6-F8 or Alt+1-3 use suggestion "
-                                    "or complete nick · ↑/↓ input history · Ctrl+R rephrase · "
-                                    "Ctrl+Z undo rephrase · F5 catch-up · Alt+←/→ switch tabs · "
-                                    "Ctrl+Q quit", style="")
+                    pane.write_info("Keys:", style="bold")
+                    for key, text in c.KEYS:
+                        pane.write_info(f"  {key}  - {text}", style="")
             case _:
                 raise c.CommandError(f"Unknown command /{cmd.name}. Try /help.")
 
@@ -718,6 +720,13 @@ class IRCApp(App):
             return
         bar.update("")
         bar.remove_class("visible")
+
+    def action_show_help(self) -> None:
+        # Priority binding, so F1 reaches here while the HelpScreen is open too: toggle it shut.
+        if isinstance(self.screen, HelpScreen):
+            self.screen.dismiss()
+        else:
+            self.push_screen(HelpScreen())
 
     def action_suggest_now(self) -> None:
         pane = self.active_buffer()

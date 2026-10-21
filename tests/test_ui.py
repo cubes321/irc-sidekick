@@ -3,12 +3,16 @@ import asyncio
 import re
 
 import pytest
+from rich.console import Console
 from textual import events
+from textual.containers import VerticalScroll
+from textual.widgets import Static
 
 from llm_irc.config import Config, FeatureConfig, LLMConfig, NetworkConfig
 from llm_irc.ui import app as app_module
 from llm_irc.ui.app import IRCApp
 from llm_irc.ui.buffer import ChatBuffer
+from llm_irc.ui.help_view import HelpScreen
 from llm_irc.ui.profile_view import ProfileScreen
 from tests.fake_ircd import FakeIRCd
 
@@ -446,3 +450,35 @@ async def test_terminal_window_events_dont_crash(ircd, tmp_path, monkeypatch):
             await pilot.pause(0.05)
         assert app.is_running
         assert app._exception is None
+
+
+async def test_f1_help(ircd, tmp_path, monkeypatch):
+    server, port = ircd
+    monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)
+    app = IRCApp(make_config(port, tmp_path))
+    async with app.run_test(size=(120, 30)) as pilot:
+        home = await start(app, pilot)
+        await pilot.press("f1")
+        await wait_for(pilot, lambda: isinstance(app.screen, HelpScreen))
+        console = Console(width=200)
+        with console.capture() as capture:
+            for static in app.screen.query(Static):
+                console.print(static.content)
+        text = capture.get()
+        assert "Ctrl+Q" in text and "/rephrase" in text  # keys and commands both listed
+        assert "/part [#channel] [reason]" in text  # not eaten as Rich markup
+        scroller = app.screen.query_one(VerticalScroll)
+        assert scroller.has_focus and scroller.max_scroll_y > 0  # too long for 30 rows
+        await pilot.press("pagedown")
+        await wait_for(pilot, lambda: scroller.scroll_y > 0)
+
+        await pilot.press("f1")  # F1 toggles it shut
+        await wait_for(pilot, lambda: not isinstance(app.screen, HelpScreen))
+        await pilot.press("f1")
+        await wait_for(pilot, lambda: isinstance(app.screen, HelpScreen))
+        await pilot.press("escape")
+        await wait_for(pilot, lambda: not isinstance(app.screen, HelpScreen))
+        assert app.input.has_focus
+
+        await type_line(pilot, app, "/help")
+        await wait_for(pilot, lambda: "Ctrl+Space / F2  - ask for reply" in log_text(home))

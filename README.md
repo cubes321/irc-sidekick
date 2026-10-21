@@ -3,6 +3,7 @@
 A terminal IRC client (Python + [Textual](https://textual.textualize.io/)) with a local
 LLM (LM Studio) working in the background.
 
+- `F1` lists every key and command (`/help` prints the same list in the chat)
 - Tabs per network, channel and private chat; `/join`, `/part`, `/close` from inside the client
 - IRC basics: op/voice changes show live in the member list, `↑`/`↓` recall what you typed,
   `/away`, `/whois`, and `/ignore nick` (saved; hides their messages and keeps them out of

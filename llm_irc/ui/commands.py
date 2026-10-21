@@ -36,6 +36,27 @@ HELP = {
 
 ALIASES = {"j": "join", "leave": "part", "q": "query", "m": "msg", "exit": "quit", "wc": "close"}
 
+# Shown by F1 and /help; keep in step with IRCApp.BINDINGS.
+KEYS = [
+    ("F1", "show this help"),
+    ("Ctrl+Space / F2", "ask for reply suggestions now (builds on your draft)"),
+    ("Tab", "cycle suggestions into the input, or complete a nick"),
+    ("F6-F8 / Alt+1-3", "put suggestion 1-3 into the input"),
+    ("Esc", "dismiss suggestions"),
+    ("Ctrl+R", "rephrase your draft"),
+    ("Ctrl+Z", "undo the rephrase"),
+    ("F5", "catch up: summarize unread messages"),
+    ("Up / Down", "recall lines you've sent"),
+    ("Alt+Left / Alt+Right", "previous / next tab (also Ctrl+PgUp / Ctrl+PgDn)"),
+    ("Ctrl+Q", "quit"),
+]
+
+
+def usage_and_description(help_text: str) -> tuple[str, str]:
+    """'/join #channel [key]  - join a channel' -> ('/join #channel [key]', 'join a channel')."""
+    usage, _, description = help_text.partition("  - ")
+    return usage, description
+
 
 @dataclass
 class Command:

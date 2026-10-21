@@ -26,6 +26,12 @@ def test_every_command_has_help():
         assert target in c.HELP
 
 
+def test_help_entries_split_into_usage_and_description():
+    for name, text in c.HELP.items():
+        usage, description = c.usage_and_description(text)
+        assert usage.startswith("/" + name) and description, name
+
+
 def test_split_scope():
     assert c.split_scope("-all foo bar", "#here") == (None, "foo bar")
     assert c.split_scope("#chan foo", None) == ("#chan", "foo")
