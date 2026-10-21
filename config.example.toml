@@ -1,0 +1,55 @@
+# Copy to config.toml and edit.
+
+# SQLite file for message history and user profiles (relative to this file).
+db_path = "llm_irc.sqlite3"
+
+[[networks]]
+name = "libera"
+host = "irc.libera.chat"
+port = 6697
+tls = true
+nick = "mynick"
+alt_nicks = ["mynick_", "mynick__"]
+channels = ["#test"]
+# Name of an environment variable holding your NickServ password (never put it here).
+auth = "nickserv"
+auth_password_env = "LIBERA_NICKSERV_PASS"   # name of an env var; never put the password here
+# server_password_env = ""
+# tls_verify = true        # only set false for a server with a self-signed cert
+
+# QuakeNet: no NickServ; log in to Q with CHALLENGEAUTH, so the password never crosses
+# the network (QuakeNet has no TLS). hide_host sets +x and waits for it before joining.
+# [[networks]]
+# name = "quakenet"
+# host = "irc.quakenet.org"
+# port = 6667
+# tls = false
+# nick = "mynick"
+# channels = ["#mychannel"]
+# auth = "q"
+# auth_username = "myQaccount"
+# auth_password_env = "QUAKENET_PASS"
+# hide_host = true
+
+# Add more [[networks]] blocks to connect to several networks at once.
+
+[llm]
+enabled = true
+base_url = "http://localhost:1234/v1"   # LM Studio's OpenAI-compatible server
+model = ""                 # empty = use the first chat model LM Studio has loaded
+max_concurrency = 3        # parallel requests your LM Studio model allows
+context_lines = 25         # recent lines sent to the model for suggestions
+suggest_debounce_s = 2.0   # wait for the channel to go quiet before suggesting
+temperature = 0.7
+reasoning_effort = "none"  # turns off "thinking" in reasoning models (Qwen3 etc.) so
+                           # replies are fast; set "" to leave the model's default
+
+[features]
+auto_suggest = true        # suggest replies automatically in the active tab
+suggestion_count = 3
+summary_threshold = 50     # offer a catch-up summary after this many unread lines
+triage_keywords = []       # extra words that highlight a message, e.g. ["python", "deploy"]
+llm_triage = true          # let the LLM flag questions aimed at you in background tabs
+translate_target = "English"
+profiles = true            # build per-user personality profiles (stored locally only)
+profile_batch = 30         # refresh a user's profile every N of their messages
