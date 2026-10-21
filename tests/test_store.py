@@ -43,6 +43,7 @@ def test_unversioned_database_upgrades_and_keeps_data(tmp_path):
 
     store = Store(str(path))
     assert [m.text for m in store.recent("net", "#c", 10)] == ["the release is on friday"]
+    assert [m.text for m in store.search("net", ["friday"])] == ["the release is on friday"]
     assert store.get_profile("net", "bob").profile == "Summary: tester"
     store.close()
     assert user_version(path) == len(db.MIGRATIONS)
@@ -111,4 +112,78 @@ def test_suggestion_stats(tmp_path):
     store.add_suggestion_event("other", "#c", "edited")
     assert store.suggestion_stats("net") == {"picked": 2, "dismissed": 1, "ignored": 1}
     assert store.suggestion_stats("nowhere") == {}
+    store.close()
+
+
+def make_log(tmp_path) -> Store:
+    store = Store(str(tmp_path / "log.sqlite3"))
+    texts = ["the release is on friday", "who broke the build", "release notes are up",
+             "lunch?", "c++ templates are hard", "friday release got moved", "ok"]
+    for i, text in enumerate(texts):
+        store.add_message("net", "#dev", "bob", text, "msg", False, float(i))
+    store.add_message("net", "#other", "amy", "release party at 5", "msg", False, 10.0)
+    store.add_message("net2", "#dev", "bob", "release elsewhere", "msg", False, 11.0)
+    return store
+
+
+def test_search_all_words_newest_first_with_filters(tmp_path):
+    store = make_log(tmp_path)
+    assert [m.text for m in store.search("net", ["release", "friday"])] == [
+        "friday release got moved", "the release is on friday"]
+    assert [m.text for m in store.search("net", ["release"], buffer="#OTHER")] == [
+        "release party at 5"]
+    assert len(store.search("net", ["release"])) == 4  # not net2
+    assert [m.text for m in store.search("net", ["releas"])][0] == "release party at 5"
+    assert store.search("net", ["release"], limit=2)[0].text == "release party at 5"
+    store.close()
+
+
+def test_search_any_word_ranks_by_relevance(tmp_path):
+    store = make_log(tmp_path)
+    hits = store.search("net", ["friday", "lunch"], match_any=True)
+    assert {m.text for m in hits} == {"the release is on friday", "friday release got moved",
+                                      "lunch?"}
+    store.close()
+
+
+def test_search_input_cannot_break_fts(tmp_path):
+    store = make_log(tmp_path)
+    for words in (["c++", "("], ['"'], ["*"], ["NEAR", "AND"], ["-"], ["c++"], ["it's"]):
+        store.search("net", words)
+        store.search("net", words, match_any=True)
+    assert [m.text for m in store.search("net", ["c++"])] == ["c++ templates are hard"]
+    assert store.search("net", ["*", "?"]) == []
+    store.close()
+
+
+def test_like_fallback_matches_fts(tmp_path):
+    store = make_log(tmp_path)
+    fts = [m.id for m in store.search("net", ["release", "friday"])]
+    store.fts = False
+    assert [m.id for m in store.search("net", ["release", "friday"])] == fts
+    assert [m.text for m in store.search("net", ["c++"])] == ["c++ templates are hard"]
+    assert store.search("net", ["100%"]) == []
+    store.close()
+
+
+def test_around_and_excerpts(tmp_path):
+    store = make_log(tmp_path)
+    rows = store.recent("net", "#dev", 10)
+    around = store.around("net", "#dev", rows[3].id, before=1, after=1)
+    assert [m.text for m in around] == ["release notes are up", "lunch?",
+                                        "c++ templates are hard"]
+    assert store.around("net", "#dev", rows[-1].id, before=0, after=5)[-1].text == "ok"
+
+    # Overlapping windows merge; separate buffers stay apart; output is in time order.
+    other = store.search("net", ["party"])
+    excerpts = store.excerpts("net", [rows[5], rows[1], *other], context=1)
+    assert [[m.text for m in window] for window in excerpts] == [
+        ["the release is on friday", "who broke the build", "release notes are up"],
+        ["c++ templates are hard", "friday release got moved", "ok"],
+        ["release party at 5"]]
+    # The line cap stops adding windows.
+    assert len(store.excerpts("net", [rows[5], rows[1]], context=1, max_lines=4)) == 1
+    # A window bridging two earlier ones joins them.
+    bridged = store.excerpts("net", [rows[0], rows[4], rows[2]], context=1)
+    assert [len(window) for window in bridged] == [6]
     store.close()

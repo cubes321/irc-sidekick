@@ -1,6 +1,7 @@
 """SQLite storage: message log, read markers and per-user profiles. Local only."""
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -41,6 +42,26 @@ CREATE TABLE IF NOT EXISTS profiles (
 );
 """
 
+# Full-text index over messages.text. Messages are never updated, so no update trigger.
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    text, content='messages', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts (rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts (messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+INSERT INTO messages_fts (messages_fts) VALUES ('rebuild');
+"""
+
+
+def _fts_step(db: sqlite3.Connection) -> str:
+    # Without FTS5 (rare SQLite builds) the version still advances and search uses LIKE.
+    has_fts5 = db.execute("SELECT sqlite_compileoption_used('ENABLE_FTS5')").fetchone()[0]
+    return FTS_SCHEMA if has_fts5 else ""
+
+
 # Schema history, applied in order and tracked in PRAGMA user_version. Never edit a
 # released step; append a new one. A step is SQL, or a function of the connection
 # returning SQL. Step 1's IF NOT EXISTS lets databases from before versioning pass.
@@ -62,6 +83,7 @@ MIGRATIONS: list = [
     -- Own lines are a small share of the log; keeps the style-example query cheap.
     CREATE INDEX IF NOT EXISTS idx_messages_own ON messages(network, id) WHERE own = 1;
     """,
+    _fts_step,
 ]
 
 
@@ -86,6 +108,17 @@ class Profile:
     updated: float | None
 
 
+def _fts_query(words: list[str], match_any: bool) -> str:
+    """Each word quoted, so user input can't be FTS syntax; longer words match as prefixes."""
+    terms = []
+    for word in words:
+        if not any(ch.isalnum() for ch in word):
+            continue  # a punctuation-only term matches nothing and would void an AND query
+        quoted = '"' + word.replace('"', '""') + '"'
+        terms.append(quoted + "*" if len(word) >= 3 and word.isalnum() else quoted)
+    return (" OR " if match_any else " ").join(terms)
+
+
 def _row(r: tuple) -> StoredMessage:
     """A StoredMessage from `SELECT id, buffer, nick, text, kind, own, ts`."""
     return StoredMessage(r[0], r[1], r[2], r[3], r[4], bool(r[5]), r[6])
@@ -102,6 +135,8 @@ class Store:
         except sqlite3.Error:
             self.db.close()
             raise
+        self.fts = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'").fetchone() is not None
 
     def _migrate(self) -> None:
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
@@ -161,6 +196,82 @@ class Store:
             "ORDER BY buffer = ? DESC, id DESC LIMIT ?",
             (network, key, key, limit)).fetchall()
         return [_row(r) for r in rows]
+
+    # --- search ---
+
+    def search(self, network: str, words: list[str], *, buffer: str | None = None,
+               limit: int = 20, match_any: bool = False) -> list[StoredMessage]:
+        """Messages containing all `words` (newest first), or any of them (best first)."""
+        query = _fts_query(words, match_any)
+        if not query:
+            return []
+        if not self.fts:
+            return self._search_like(network, words, buffer, limit, match_any)
+        where, params = "messages_fts MATCH ? AND m.network = ?", [query, network]
+        if buffer:
+            where += " AND m.buffer = ?"
+            params.append(irc_lower(buffer))
+        order = "bm25(messages_fts)" if match_any else "m.id DESC"
+        try:
+            rows = self.db.execute(
+                "SELECT m.id, m.buffer, m.nick, m.text, m.kind, m.own, m.ts "
+                "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
+                f"WHERE {where} ORDER BY {order} LIMIT ?", (*params, limit)).fetchall()
+        except sqlite3.OperationalError:
+            return self._search_like(network, words, buffer, limit, match_any)
+        return [_row(r) for r in rows]
+
+    def _search_like(self, network: str, words: list[str], buffer: str | None,
+                     limit: int, match_any: bool) -> list[StoredMessage]:
+        terms = [w for w in words if any(ch.isalnum() for ch in w)]
+        if not terms:
+            return []
+        escaped = ["%" + re.sub(r"([\\%_])", r"\\\1", w) + "%" for w in terms]
+        match = (" OR " if match_any else " AND ").join(["text LIKE ? ESCAPE '\\'"] * len(terms))
+        where, params = f"network = ? AND ({match})", [network, *escaped]
+        if buffer:
+            where += " AND buffer = ?"
+            params.append(irc_lower(buffer))
+        rows = self.db.execute(
+            "SELECT id, buffer, nick, text, kind, own, ts FROM messages "
+            f"WHERE {where} ORDER BY id DESC LIMIT ?", (*params, limit)).fetchall()
+        return [_row(r) for r in rows]
+
+    def around(self, network: str, buffer: str, msg_id: int, before: int = 3,
+               after: int = 3) -> list[StoredMessage]:
+        """A message with its neighbours in the same buffer, oldest first."""
+        key = irc_lower(buffer)
+        older = self.db.execute(
+            "SELECT id, buffer, nick, text, kind, own, ts FROM messages "
+            "WHERE network = ? AND buffer = ? AND id <= ? ORDER BY id DESC LIMIT ?",
+            (network, key, msg_id, before + 1)).fetchall()
+        newer = self.db.execute(
+            "SELECT id, buffer, nick, text, kind, own, ts FROM messages "
+            "WHERE network = ? AND buffer = ? AND id > ? ORDER BY id LIMIT ?",
+            (network, key, msg_id, after)).fetchall()
+        return [_row(r) for r in [*reversed(older), *newer]]
+
+    def excerpts(self, network: str, hits: list[StoredMessage], *, context: int = 3,
+                 max_lines: int = 60) -> list[list[StoredMessage]]:
+        """Hits (best first) widened with context, overlaps merged, in time order."""
+        windows: list[dict[int, StoredMessage]] = []
+        total = 0
+        for hit in hits:
+            if any(hit.id in window for window in windows):
+                continue
+            merged = {row.id: row for row in self.around(network, hit.buffer, hit.id,
+                                                          context, context)}
+            # Shared ids mean the same buffer: join every window this one touches.
+            touching = [w for w in windows if w.keys() & merged.keys()]
+            for window in touching:
+                merged.update(window)
+            added = len(merged) - sum(len(window) for window in touching)
+            if total + added > max_lines:
+                break
+            total += added
+            windows = [w for w in windows if not any(w is t for t in touching)] + [merged]
+        ordered = [sorted(window.values(), key=lambda row: row.id) for window in windows]
+        return sorted(ordered, key=lambda window: window[0].id)
 
     # --- suggestion feedback ---
 

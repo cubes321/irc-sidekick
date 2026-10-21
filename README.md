@@ -10,6 +10,9 @@ LLM (LM Studio) working in the background.
   Your own recent lines are shown to the model so suggestions sound like you
   (`features.style_examples`); `/stats` shows how often you use them.
 - **Catch-up summary**: `F5` or `/summary` summarizes what you missed in a tab
+- **Search & ask**: `/search release friday` finds logged messages (this tab; `#chan` or
+  `-all` to widen). `/ask when is the release?` has the LLM answer from matching log
+  excerpts, citing dates, and says so when the log doesn't cover it.
 - **Rephrase**: `Ctrl+R` makes your draft polite; `/rephrase concise|casual|formal|fix|lang:German`.
   `Ctrl+Z` undoes it.
 - **Mention triage**: your nick and `triage_keywords` highlight instantly. In background tabs the

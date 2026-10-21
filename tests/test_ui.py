@@ -1,5 +1,6 @@
 """End-to-end: the Textual app against the fake IRC server and a fake LLM."""
 import asyncio
+import re
 
 import pytest
 from textual import events
@@ -33,6 +34,8 @@ class FakeLLM:
             return "Summary: chatty tester\nTone: friendly"
         if "Translate" in system:
             return "Hello everyone"
+        if "past IRC conversations" in system:
+            return "- bob said **friday** [2026-10-01 14:02]"
         return "none"
 
     async def close(self):
@@ -201,6 +204,37 @@ async def test_style_examples_and_suggestion_feedback(ircd, tmp_path, monkeypatc
         await type_line(pilot, app, "/stats")
         await wait_for(pilot, lambda: "1 picked, 1 edited, 1 dismissed, 1 ignored"
                        in log_text(app.find("fake", "#second")))
+
+
+async def test_search_and_ask(ircd, tmp_path, monkeypatch):
+    server, port = ircd
+    monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)
+    app = IRCApp(make_config(port, tmp_path))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await wait_for(pilot, lambda: app.find("fake", "#home") is not None
+                       and app.find("fake", "#home").joined)
+        home = app.find("fake", "#home")
+        app.tabs.active = home.id
+        await pilot.pause(0.1)
+        server.inject(":bob!b@h PRIVMSG #home :the release is on friday")
+        server.inject(":bob!b@h PRIVMSG #home :lunch anyone")
+        await wait_for(pilot, lambda: len(home.history) == 2)
+
+        await type_line(pilot, app, "/search release")
+        await wait_for(pilot, lambda: "1 matches for 'release' in #home" in log_text(home))
+        assert "<bob> the release is on friday" in log_text(home)
+        await type_line(pilot, app, "/search -all zzz")
+        await wait_for(pilot, lambda: "No messages match 'zzz' in all tabs" in log_text(home))
+        await type_line(pilot, app, "/search")
+        await wait_for(pilot, lambda: "usage: /search" in log_text(home))
+
+        await type_line(pilot, app, "/ask when is the release?")
+        await wait_for(pilot, lambda: "bob said friday [2026-10-01 14:02]" in log_text(home))
+        prompt = app.llm.prompts[-1]
+        assert "the release is on friday" in prompt and "when is the release?" in prompt
+        assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] <bob>", prompt)
+        await type_line(pilot, app, "/ask what did they say?")
+        await wait_for(pilot, lambda: "Ask about something specific" in log_text(home))
 
 
 async def test_query_and_translate(ircd, tmp_path, monkeypatch):

@@ -1,3 +1,5 @@
+import re
+
 from llm_irc.llm import features as f
 from llm_irc.llm.provider import strip_reasoning
 
@@ -68,3 +70,24 @@ async def test_suggest_includes_style_examples():
     assert "- lol yeah same" in llm.user
     await f.suggest(llm, nick="me", channel="#c", topic="", lines=lines, n=2)
     assert "usually writes" not in llm.user
+
+
+def test_keywords():
+    assert f.keywords("when is the release for py 3.12?") == ["release", "3", "12"]
+    assert f.keywords("did anyone mention the deploy script?") == ["deploy", "script"]
+    assert f.keywords("what did they say?") == []
+
+
+def test_render_with_dates():
+    line = f.Line("bob", "hi", ts=1_700_000_000)
+    assert re.match(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] <bob> hi", line.render(dates=True))
+    assert re.match(r"\[\d{2}:\d{2}\] <bob> hi", line.render())
+
+
+async def test_ask_prompt_has_dated_excerpts():
+    llm = CapturingLLM()
+    await f.ask(llm, nick="me", question="when is the release?",
+                excerpts=[("#home", [f.Line("bob", "friday", ts=1_700_000_000)])])
+    assert "--- #home ---" in llm.user
+    assert re.search(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] <bob> friday", llm.user)
+    assert "when is the release?" in llm.user

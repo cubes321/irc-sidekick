@@ -28,6 +28,8 @@ from .profile_view import ProfileScreen
 
 STATUS_KEY = "\x00status"
 BACKLOG_LINES = 40
+SEARCH_LIMIT = 20
+ASK_HITS, ASK_CONTEXT, ASK_MAX_LINES = 12, 3, 60  # matches, lines around each, total cap
 
 
 class IRCApp(App):
@@ -478,6 +480,10 @@ class IRCApp(App):
                 pane.write_info(f"Translation into {self.cfg.features.translate_target} "
                                 f"{'on' if pane.translate else 'off'} for this tab.")
                 self.update_statusline()
+            case "search" | "ask":
+                default = None if pane.kind == "status" else pane.buffer_name
+                buffer, text = c.split_scope(cmd.rest, default)
+                (self.search if cmd.name == "search" else self.ask)(pane, buffer, text)
             case "profile":
                 c.require(cmd, 1)
                 self.show_profile(net, cmd.args[0])
@@ -820,16 +826,61 @@ class IRCApp(App):
                                        lines=lines),
             key=f"summary:{pane.id}")
 
-        def done(summary: str) -> None:
-            pane.write_info("── Catch-up summary ──", style="bold cyan")
-            for text in summary.splitlines():
-                if text.strip():
-                    # Models answer in Markdown; the terminal shows it raw.
-                    text = re.sub(r"^\s*[-*•]\s+", "• ", text.replace("**", ""))
-                    pane.log_view.write(Text("   " + text.replace("`", ""), style="cyan"))
-            pane.write_info("──────────────────────", style="bold cyan")
+        self._when_done(future, partial(self._write_answer, pane, "Catch-up summary"),
+                        lambda e: pane.write_error(f"Summary failed: {e}"))
 
-        self._when_done(future, done, lambda e: pane.write_error(f"Summary failed: {e}"))
+    def _write_answer(self, pane: ChatBuffer, title: str, answer: str) -> None:
+        pane.write_info(f"── {title} ──", style="bold cyan")
+        for text in answer.splitlines():
+            if text.strip():
+                # Models answer in Markdown; the terminal shows it raw.
+                text = re.sub(r"^\s*[-*•]\s+", "• ", text.replace("**", ""))
+                pane.log_view.write(Text("   " + text.replace("`", ""), style="cyan"))
+        pane.write_info("──────────────────────", style="bold cyan")
+
+    # --- search and ask ---------------------------------------------------------------
+
+    def search(self, pane: ChatBuffer, buffer: str | None, query: str) -> None:
+        words = query.split()
+        if not words:
+            raise c.CommandError(f"usage: {c.HELP['search']}")
+        rows = self.store.search(pane.network, words, buffer=buffer, limit=SEARCH_LIMIT)
+        where = buffer or "all tabs"
+        if not rows:
+            pane.write_info(f"No messages match '{query}' in {where}.")
+            return
+        more = " (newest shown)" if len(rows) == SEARCH_LIMIT else ""
+        pane.write_info(f"── {len(rows)} matches for '{query}' in {where}{more} ──",
+                        style="bold cyan")
+        for row in reversed(rows):
+            pane.write_found(row.ts, "" if buffer else row.buffer, row.nick, row.text,
+                             row.kind, words)
+
+    def ask(self, pane: ChatBuffer, buffer: str | None, question: str) -> None:
+        if not question:
+            raise c.CommandError(f"usage: {c.HELP['ask']}")
+        self._require_llm()
+        words = features.keywords(question)
+        if not words:
+            raise c.CommandError("Ask about something specific: a name, a word or a topic.")
+        hits = self.store.search(pane.network, words, buffer=buffer, limit=ASK_HITS,
+                                 match_any=True)
+        excerpts = self.store.excerpts(pane.network, hits, context=ASK_CONTEXT,
+                                       max_lines=ASK_MAX_LINES)
+        if not excerpts:
+            pane.write_info(f"Nothing in the log mentions {' or '.join(words)}.")
+            return
+        blocks = [(rows[0].buffer, [Line(r.nick, r.text, r.kind, r.ts) for r in rows])
+                  for rows in excerpts]
+        pane.write_info(f"Asking about {sum(len(rows) for rows in excerpts)} logged lines...",
+                        style="italic cyan")
+        nick = self.clients[pane.network].state.nick
+        future = self.scheduler.submit(
+            Priority.USER,
+            lambda: features.ask(self.llm, nick=nick, question=question, excerpts=blocks),
+            key=f"ask:{pane.id}")
+        self._when_done(future, partial(self._write_answer, pane, "Answer"),
+                        lambda e: pane.write_error(f"Ask failed: {e}"))
 
     # --- translation ------------------------------------------------------------------
 
