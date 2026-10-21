@@ -5,7 +5,7 @@ description = "Terminal IRC client with a local LLM (LM Studio) that suggests re
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
-dependencies = ["textual>=1.0", "openai>=1.0"]
+dependencies = ["textual>=1.0", "openai>=1.0", "httpx>=0.24"]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
