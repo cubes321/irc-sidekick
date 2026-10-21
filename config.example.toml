@@ -53,3 +53,5 @@ llm_triage = true          # let the LLM flag questions aimed at you in backgrou
 translate_target = "English"
 profiles = true            # build per-user personality profiles (stored locally only)
 profile_batch = 30         # refresh a user's profile every N of their messages
+style_examples = 8         # your recent lines shown to the model so suggestions sound
+                           # like you (0 = off)

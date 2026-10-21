@@ -107,6 +107,19 @@ class NamesUpdated(Event):
     channel: str
 
 
+@dataclass
+class ModeChanged(Event):
+    channel: str
+    by: str
+    modes: str  # as sent, e.g. "+o-v alice bob"
+
+
+@dataclass
+class WhoisReply(Event):
+    nick: str
+    lines: list[str]
+
+
 # --- Rate limiting --------------------------------------------------------------------
 
 class TokenBucket:
@@ -147,6 +160,10 @@ class IRCClient:
         self._join_task: asyncio.Task | None = None
         self._q_pending = False
         self.account: str | None = None
+        self.away = False
+        self._away_seen: dict[str, str] = {}  # irc_lower(nick) -> last away message shown
+        self._whois: dict[str, list[str]] = {}  # irc_lower(nick) -> reply lines so far
+        self.ignored: set[str] = set()  # irc_lower(nick); filled from the store by the UI
 
     # --- public API ---
 
@@ -206,6 +223,14 @@ class IRCClient:
     def set_nick(self, nick: str) -> None:
         self.send_raw(m.serialize("NICK", nick))
 
+    def set_away(self, message: str = "") -> None:
+        """Mark ourselves away with `message`, or back when it is empty."""
+        self.send_raw(m.serialize("AWAY", message) if message else "AWAY")
+
+    def whois(self, nick: str) -> None:
+        self._whois[irc_lower(nick)] = []
+        self.send_raw(m.serialize("WHOIS", nick))
+
     def topic(self, channel: str, text: str | None = None) -> None:
         if text is None:
             self.send_raw(m.serialize("TOPIC", channel))
@@ -241,6 +266,9 @@ class IRCClient:
         self._nick_attempt = 0
         self.state.channels.clear()
         self.state.nick = net.nick
+        self.away = False
+        self._away_seen.clear()
+        self._whois.clear()
 
         if net.server_password:
             self._write_now(m.serialize("PASS", net.server_password))
@@ -415,6 +443,46 @@ class IRCClient:
         """Send without echoing to the UI (used for passwords)."""
         self.send_raw(m.serialize("PRIVMSG", target, text))
 
+    def _on_005(self, msg: m.Message) -> None:  # RPL_ISUPPORT: me, tokens..., text
+        self.state.isupport(msg.params[1:-1])
+        self._on_numeric(msg)
+
+    def _on_301(self, msg: m.Message) -> None:  # RPL_AWAY: me, nick, message
+        if len(msg.params) < 3:
+            return
+        nick, text = msg.params[1], msg.params[2]
+        key = irc_lower(nick)
+        # Part of a WHOIS reply only once that reply has begun (311 comes first): an
+        # earlier 301 answers a message we sent before the WHOIS left the send queue.
+        if self._whois.get(key):
+            self._whois[key].append(f"away: {text}")
+        elif self._away_seen.get(key) != text:  # servers repeat it for every message
+            self._away_seen[key] = text
+            self._emit(Status(f"{nick} is away: {text}", buffer=nick))
+
+    def _on_305(self, msg: m.Message) -> None:  # RPL_UNAWAY
+        self.away = False
+        self._on_numeric(msg)
+
+    def _on_306(self, msg: m.Message) -> None:  # RPL_NOWAWAY
+        self.away = True
+        self._on_numeric(msg)
+
+    def _on_318(self, msg: m.Message) -> None:  # RPL_ENDOFWHOIS: me, nick, text
+        nick = msg.params[1] if len(msg.params) > 1 else ""
+        lines = self._whois.pop(irc_lower(nick), None)
+        if lines is None:
+            self._on_numeric(msg)  # e.g. a WHOIS sent with /raw
+        else:
+            self._emit(WhoisReply(nick, lines))
+
+    def _on_401(self, msg: m.Message) -> None:  # ERR_NOSUCHNICK: me, nick, text
+        lines = self._whois.get(irc_lower(msg.params[1])) if len(msg.params) > 1 else None
+        if lines is not None:
+            lines.append("no such nick")  # 318 follows and reports it
+        else:
+            self._on_numeric(msg)
+
     def _on_433(self, msg: m.Message) -> None:  # ERR_NICKNAMEINUSE
         if self.connected:
             self._emit(Status(f"Nick {msg.params[1]} is already in use", error=True))
@@ -498,6 +566,20 @@ class IRCClient:
             chan.names_end()
             self._emit(NamesUpdated(channel))
 
+    def _on_mode(self, msg: m.Message) -> None:
+        if len(msg.params) < 2:
+            return
+        target, modes = msg.params[0], " ".join(msg.params[1:])
+        if not is_channel(target):
+            self._emit(Status(f"Mode {target} {modes}"))  # user modes, e.g. our +x
+            return
+        chan = self.state.channel(target)
+        for change, arg in self.state.parse_modes(msg.params[1], msg.params[2:]):
+            char = self.state.prefix_char(change[1])
+            if chan is not None and char and arg:
+                chan.set_prefix(arg, char, change[0] == "+")
+        self._emit(ModeChanged(target, msg.nick or "?", modes))
+
     def _on_privmsg(self, msg: m.Message) -> None:
         self._on_chat(msg, notice=False)
 
@@ -511,6 +593,8 @@ class IRCClient:
         target, text = msg.params[0], msg.params[1]
         if notice and msg.prefix and msg.prefix.lower() == Q_PREFIX and self._on_q_notice(text):
             return
+        if irc_lower(nick) in self.ignored:
+            return  # before CTCP handling too, so ignored users get no automatic replies
         # Notices from the server itself (or before registration) go to the status tab.
         if notice and (msg.prefix is None or "!" not in msg.prefix or target == "*"):
             self._emit(Status(f"-{nick}- {text}"))
@@ -541,6 +625,12 @@ class IRCClient:
     def _on_numeric(self, msg: m.Message) -> None:
         code = int(msg.command)
         rest = msg.params[1:]  # params[0] is our nick
+        # Replies about a nick we sent WHOIS for are collected until 318. Servers send
+        # many different ones (276, 307, 320, 338, 671...), so take any 2xx/3xx.
+        whois = self._whois.get(irc_lower(rest[0])) if len(rest) >= 2 else None
+        if whois is not None and code < 400:
+            whois.append(_whois_line(code, msg.params))
+            return
         # 4xx/5xx errors that name a channel or nick get shown in that tab.
         if 400 <= code < 600 and len(rest) >= 2:
             self._emit(Status(" ".join(rest[1:]) + f" ({rest[0]})", buffer=rest[0], error=True))
@@ -550,3 +640,35 @@ class IRCClient:
 
 class _PingTimeout(Exception):
     pass
+
+
+def _whois_line(code: int, p: list[str]) -> str:
+    """One readable line from a WHOIS reply (p[0] is our nick, p[1] theirs)."""
+    match code:
+        case 311 if len(p) >= 6:  # user host * :realname
+            return f"{p[1]}!{p[2]}@{p[3]} ({p[-1]})"
+        case 312 if len(p) >= 4:  # server :info
+            return f"server: {p[2]} ({p[3]})"
+        case 317 if len(p) >= 4 and p[2].isdigit():  # idle signon :text
+            text = f"idle {_duration(int(p[2]))}"
+            if len(p) >= 5 and p[3].isdigit():
+                signon = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(p[3])))
+                text += f", signed on {signon}"
+            return text
+        case 319:
+            return f"channels: {p[-1]}"
+        case 330 if len(p) >= 4:  # account :is logged in as
+            return f"account: {p[2]}"
+    return " ".join(p[2:])
+
+
+def _duration(seconds: int) -> str:
+    """125 -> '2m 5s'."""
+    parts = []
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            parts.append(f"{seconds // size}{unit}")
+            seconds %= size
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
