@@ -96,6 +96,11 @@ async def test_join_chat_suggest_part(ircd, tmp_path, monkeypatch):
         assert app.suggestions[0] == "sounds good"
 
         # Tab puts the first suggestion into the input; nothing is sent yet.
+        await pilot.press("f7")
+        assert app.input.value == "what happened?"
+        await pilot.press("alt+3")
+        assert app.input.value == "lol"
+        app.input.value = ""
         await pilot.press("tab")
         assert app.input.value == "sounds good"
         await pilot.press("enter")

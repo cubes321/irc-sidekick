@@ -45,9 +45,11 @@ class IRCApp(App):
     BINDINGS = [
         Binding("ctrl+space,ctrl+@,f2", "suggest_now", "Suggest", priority=True),
         Binding("tab", "tab_key", "Use suggestion", show=False, priority=True),
-        Binding("alt+1", "accept(0)", show=False, priority=True),
-        Binding("alt+2", "accept(1)", show=False, priority=True),
-        Binding("alt+3", "accept(2)", show=False, priority=True),
+        # F6-F8 too: some terminals (e.g. xterm.js-based panels) turn Alt+digit into
+        # characters like '¡' instead of sending an Alt key press.
+        Binding("alt+1,f6", "accept(0)", show=False, priority=True),
+        Binding("alt+2,f7", "accept(1)", show=False, priority=True),
+        Binding("alt+3,f8", "accept(2)", show=False, priority=True),
         Binding("ctrl+r", "rephrase", "Rephrase", priority=True),
         Binding("ctrl+z", "undo_rephrase", show=False, priority=True),
         Binding("escape", "dismiss_suggestions", show=False, priority=True),
@@ -479,7 +481,7 @@ class IRCApp(App):
                     pane.write_info("Commands:", style="bold")
                     for text in c.HELP.values():
                         pane.write_info("  " + text, style="")
-                    pane.write_info("Keys: Ctrl+Space/F2 suggest · Tab/Alt+1-3 use suggestion "
+                    pane.write_info("Keys: Ctrl+Space/F2 suggest · Tab, F6-F8 or Alt+1-3 use suggestion "
                                     "or complete nick · Ctrl+R rephrase · Ctrl+Z undo rephrase · "
                                     "F5 catch-up · Alt+←/→ switch tabs · Ctrl+Q quit", style="")
             case _:
@@ -604,9 +606,9 @@ class IRCApp(App):
         for i, option in enumerate(options):
             if i:
                 text.append("\n")
-            text.append(f"Alt+{i + 1} ", style="bold cyan")
+            text.append(f"F{i + 6} ", style="bold cyan")
             text.append(option)
-        text.append("\nTab cycles · Esc dismisses", style="dim")
+        text.append("\nTab cycles · F6-F8 (or Alt+1-3) pick · Esc dismisses", style="dim")
         self.show_bar(text)
 
     def clear_suggestions(self) -> None:
