@@ -16,6 +16,7 @@ from textual.widgets import Footer, Input, Static, TabbedContent
 
 from ..config import Config
 from ..irc import client as ev
+from ..irc.auth import is_service, mask
 from ..irc.client import IRCClient
 from ..irc.state import irc_lower, is_channel
 from ..llm import features
@@ -348,6 +349,10 @@ class IRCApp(App):
     # --- incoming / outgoing chat -----------------------------------------------------
 
     def handle_chat(self, pane: ChatBuffer, msg: ev.ChatMessage) -> None:
+        if msg.own and is_service(pane.buffer_name):
+            # May carry a password: echo it masked; keep it out of the log and the LLM.
+            pane.write_chat(msg.nick, mask(msg.text), msg.kind, own=True, ts=msg.ts)
+            return
         net = pane.network
         my_nick = self.clients[net].state.nick
         pane.last_db_id = self.store.add_message(
@@ -808,6 +813,8 @@ class IRCApp(App):
 
         pane.last_db_id is the sent line: sending stores it synchronously.
         """
+        if is_service(pane.buffer_name):
+            return  # the line wasn't stored, and sent_text could be a password
         net, sent = pane.network, text.strip()
         if accepted is not None:
             index, option = accepted

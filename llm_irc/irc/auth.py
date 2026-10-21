@@ -15,12 +15,28 @@ from .state import irc_lower
 Q_TARGET = "Q@CServe.quakenet.org"  # the full form makes sure it reaches the real Q
 Q_PREFIX = "q!theqbot@cserve.quakenet.org"
 
+# Services that take passwords by PRIVMSG (AuthServ: GameSurge, X: Undernet). Lines you
+# send them are never logged.
+SERVICES = frozenset({"nickserv", "chanserv", "memoserv", "operserv", "hostserv",
+                      "saslserv", "botserv", "authserv", "q", "x"})
+
 # Strongest first. LEGACY-MD5 is deprecated and deliberately not supported.
 _ALGORITHMS = {
     "HMAC-SHA-256": hashlib.sha256,
     "HMAC-SHA-1": hashlib.sha1,
     "HMAC-MD5": hashlib.md5,
 }
+
+
+def is_service(target: str) -> bool:
+    """NickServ, nickserv@services.example, Q@CServe.quakenet.org, ... in any case."""
+    return irc_lower(target.split("@", 1)[0]) in SERVICES
+
+
+def mask(text: str) -> str:
+    """'IDENTIFY me secret' -> 'IDENTIFY ********': keep the command, hide its arguments."""
+    command, _, rest = text.strip().partition(" ")
+    return f"{command} ********" if rest.strip() else command
 
 
 def pick_algorithm(offered: list[str]) -> str | None:

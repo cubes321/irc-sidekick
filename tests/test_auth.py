@@ -1,6 +1,6 @@
 import pytest
 
-from llm_irc.irc.auth import challengeauth_response, pick_algorithm
+from llm_irc.irc.auth import challengeauth_response, is_service, mask, pick_algorithm
 
 CHALLENGE = "12345678901234567890123456789012"
 
@@ -33,3 +33,18 @@ def test_pick_strongest_offered():
     assert pick_algorithm(["HMAC-MD5", "HMAC-SHA-1", "HMAC-SHA-256", "LEGACY-MD5"]) == "HMAC-SHA-256"
     assert pick_algorithm(["HMAC-MD5"]) == "HMAC-MD5"
     assert pick_algorithm(["LEGACY-MD5"]) is None
+
+
+def test_is_service():
+    for target in ("NickServ", "CHANSERV", "nickserv@services.libera.chat",
+                   "Q@CServe.quakenet.org", "q", "X@channels.undernet.org"):
+        assert is_service(target), target
+    for target in ("#nickserv", "bob", "nickservfan", ""):
+        assert not is_service(target), target
+
+
+def test_mask_keeps_the_command_only():
+    assert mask("IDENTIFY me secret") == "IDENTIFY ********"
+    assert mask("AUTH me  secret ") == "AUTH ********"
+    assert mask("HELP") == "HELP"
+    assert mask("HELP ") == "HELP"

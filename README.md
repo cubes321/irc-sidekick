@@ -72,6 +72,10 @@ On Windows, `setx QUAKENET_PASS "yourpassword"` stores one; open a new terminal 
   your real address. If login fails or takes longer than `auth_timeout_s`, it reports this
   and joins anyway.
 
+Lines you type to services yourself (`/msg NickServ IDENTIFY ...`, a `/query nickserv` tab,
+Q, ChanServ, ...) are shown masked, as `IDENTIFY ********`, and are never saved to the log
+or shown to the LLM.
+
 Use Windows Terminal (or any modern terminal); the legacy Windows console renders Textual poorly.
 
 ## How the LLM work is scheduled

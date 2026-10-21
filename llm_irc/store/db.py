@@ -62,6 +62,25 @@ def _fts_step(db: sqlite3.Connection) -> str:
     return FTS_SCHEMA if has_fts5 else ""
 
 
+def _forget_services_step(db: sqlite3.Connection) -> str:
+    # Lines typed to services (/msg NickServ IDENTIFY ...) used to be logged with their
+    # passwords. Buffers are irc_lower(target) and may end in @server.
+    service = ("substr(buffer, 1, instr(buffer || '@', '@') - 1) IN ('nickserv', 'chanserv', "
+               "'memoserv', 'operserv', 'hostserv', 'saslserv', 'botserv', 'authserv', 'q', 'x')")
+    has_fts = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'").fetchone() is not None
+    # secure_delete zeroes the freed bytes (some builds have it on already, so put the
+    # setting back after); optimize drops the deleted terms from old FTS segments.
+    was = ("OFF", "ON", "FAST")[db.execute("PRAGMA secure_delete").fetchone()[0]]
+    return f"""
+    PRAGMA secure_delete = ON;
+    DELETE FROM messages WHERE own = 1 AND {service};
+    DELETE FROM suggestion_events WHERE {service};
+    {"INSERT INTO messages_fts (messages_fts) VALUES ('optimize');" if has_fts else ""}
+    PRAGMA secure_delete = {was};
+    """
+
+
 # Schema history, applied in order and tracked in PRAGMA user_version. Never edit a
 # released step; append a new one. A step is SQL, or a function of the connection
 # returning SQL. Step 1's IF NOT EXISTS lets databases from before versioning pass.
@@ -93,6 +112,7 @@ MIGRATIONS: list = [
         PRIMARY KEY (network, nick_key)
     );
     """,
+    _forget_services_step,
 ]
 
 

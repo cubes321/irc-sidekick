@@ -365,6 +365,47 @@ async def test_ignore(ircd, tmp_path, monkeypatch):
         await wait_for(pilot, lambda: "i'm back" in log_text(home))
 
 
+async def test_messages_to_services_are_not_logged(ircd, tmp_path, monkeypatch):
+    server, port = ircd
+    monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)
+    app = IRCApp(make_config(port, tmp_path))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await start(app, pilot)
+        await type_line(pilot, app, "/msg NickServ IDENTIFY me secret")
+        await type_line(pilot, app, "/msg Q@CServe.quakenet.org AUTH me secret")
+        await type_line(pilot, app, "/query nickserv")
+        nickserv = app.find("fake", "NickServ")
+        await wait_for(pilot, lambda: app.active_buffer() is nickserv)
+        await type_line(pilot, app, "GHOST me secret")  # typed into the query tab
+        await wait_for(pilot, lambda: sum("secret" in line for line in server.received) == 3)
+
+        assert app.store.search("fake", ["secret"]) == []
+        assert app.store.search("fake", ["IDENTIFY"]) == []
+        assert app.store.recent("fake", "NickServ", 50) == []
+        assert app.store.recent("fake", "Q@CServe.quakenet.org", 50) == []
+        assert not nickserv.history  # nor does it reach the LLM
+
+        # Each tab shown in turn: a RichLog that was never laid out holds its writes back.
+        for pane in list(app.buffers.values()):
+            app.tabs.active = pane.id
+            await pilot.pause(0.1)
+            assert "secret" not in log_text(pane), pane.buffer_name
+        assert "<me> IDENTIFY ********" in log_text(nickserv)
+        assert "<me> GHOST ********" in log_text(nickserv)
+        assert "<me> AUTH ********" in log_text(app.find("fake", "Q@CServe.quakenet.org"))
+
+        app.tabs.active = nickserv.id
+        await pilot.pause(0.1)
+        await type_line(pilot, app, "/search -all secret")
+        await wait_for(pilot, lambda: "No messages match 'secret' in all tabs"
+                       in log_text(nickserv))
+
+        # Other private messages are still logged.
+        await type_line(pilot, app, "/msg dave hi dave")
+        await wait_for(pilot, lambda: [m.text for m in app.store.recent("fake", "dave", 5)]
+                       == ["hi dave"])
+
+
 async def test_query_and_translate(ircd, tmp_path, monkeypatch):
     server, port = ircd
     monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)

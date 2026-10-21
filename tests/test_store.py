@@ -203,3 +203,45 @@ def test_ignores_survive_reopening(tmp_path):
     assert not store.remove_ignore("net", "troll")
     assert store.ignores("net") == ["alice"]
     store.close()
+
+
+def test_cleanup_forgets_lines_sent_to_services(tmp_path, monkeypatch):
+    path = tmp_path / "leaky.sqlite3"
+    connect = sqlite3.connect
+
+    def connect_without_secure_delete(*args, **kwargs):
+        # Some SQLite builds have secure_delete on by default; test as if it were off.
+        conn = connect(*args, **kwargs)
+        conn.execute("PRAGMA secure_delete = OFF")
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", connect_without_secure_delete)
+    full_migrations = db.MIGRATIONS
+    monkeypatch.setattr(db, "MIGRATIONS", full_migrations[:-1])
+    store = Store(str(path))
+    add = store.add_message
+    add("net", "NickServ", "me", "IDENTIFY me hunter2", "msg", True, 1.0)
+    add("net", "NickServ", "NickServ", "You are now identified for me.", "msg", False, 2.0)
+    add("net", "Q@CServe.quakenet.org", "me", "AUTH me hunter2", "msg", True, 3.0)
+    add("net", "nickserv@services.example", "me", "GHOST me hunter2", "msg", True, 4.0)
+    add("net", "#home", "me", "IDENTIFY is a strange word", "msg", True, 5.0)
+    add("net", "dave", "me", "hi dave", "msg", True, 6.0)
+    store.add_suggestion_event("net", "NickServ", "ignored", sent="IDENTIFY me hunter2")
+    store.add_suggestion_event("net", "#home", "picked", sent="sounds good")
+    store.close()
+    monkeypatch.setattr(db, "MIGRATIONS", full_migrations)
+
+    store = Store(str(path))
+    assert store.db.execute("PRAGMA secure_delete").fetchone()[0] == 0  # put back
+    assert store.search("net", ["hunter2"]) == []
+    assert [m.text for m in store.recent("net", "NickServ", 10)] == [
+        "You are now identified for me."]
+    assert store.recent("net", "Q@CServe.quakenet.org", 10) == []
+    assert store.recent("net", "nickserv@services.example", 10) == []
+    assert [m.text for m in store.search("net", ["IDENTIFY"])] == [
+        "IDENTIFY is a strange word"]
+    assert [m.text for m in store.recent("net", "dave", 10)] == ["hi dave"]
+    assert store.suggestion_stats("net") == {"picked": 1}
+    store.close()
+    assert user_version(path) == len(db.MIGRATIONS)
+    assert b"hunter2" not in path.read_bytes()
