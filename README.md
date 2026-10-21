@@ -28,11 +28,32 @@ LLM (LM Studio) working in the background.
 
 ## Setup
 
+Install into a virtual environment, so the client's packages stay out of your system Python.
+
+Windows (PowerShell or cmd):
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e .[dev]
+copy config.example.toml config.toml
+python -m llm_irc
+```
+
+Linux / macOS:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .[dev]
 cp config.example.toml config.toml   # then set your nick and channels
 python -m llm_irc                    # or: python -m llm_irc -c other.toml
 ```
+
+Edit `config.toml` to set your nick and channels before starting; to use another config,
+run `python -m llm_irc -c other.toml`. Activate the venv again in each new terminal. If
+PowerShell refuses to run the activate script, skip it and start the client with
+`.venv\Scripts\python -m llm_irc`.
 
 Start LM Studio's local server (default `http://localhost:1234`) with a chat model loaded.
 The client uses whichever model is **loaded**, unless `llm.model` names one. If LM Studio is
