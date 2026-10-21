@@ -21,6 +21,7 @@ HELP = {
     "translate": "/translate [on|off]  - toggle translating foreign messages in this tab",
     "profile": "/profile nick  - show the LLM's profile of a user",
     "forget": "/forget nick  - delete a stored user profile",
+    "stats": "/stats  - how often you use the reply suggestions",
     "llm": "/llm  - reconnect to LM Studio",
     "help": "/help [command]  - list commands",
 }

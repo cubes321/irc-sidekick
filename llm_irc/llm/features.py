@@ -45,18 +45,39 @@ def parse_options(text: str, own_nick: str, limit: int) -> list[str]:
     return options[:limit]
 
 
+def style_examples(texts: Iterable[str], n: int, exclude: Iterable[str] = ()) -> list[str]:
+    """Up to `n` of the user's own lines worth showing the model as style examples."""
+    seen = {text.strip().lower() for text in exclude}
+    picked = []
+    for text in texts:
+        text = text.strip()
+        if len(picked) >= n:
+            break
+        if len(text.split()) < 2 or text.lower() in seen:
+            continue  # one-word lines say little about style; context lines are already shown
+        seen.add(text.lower())
+        picked.append(text[:120])
+    return picked
+
+
 async def suggest(llm: LLMProvider, *, nick: str, channel: str, topic: str,
                   lines: list[Line], n: int, draft: str = "",
-                  profiles: dict[str, str] | None = None) -> list[str]:
+                  profiles: dict[str, str] | None = None,
+                  style: list[str] | None = None) -> list[str]:
     profile_text = ""
     if profiles:
         sketches = "\n".join(f"- {who}: {sketch}" for who, sketch in profiles.items())
         profile_text = f"What you know about the people talking:\n{sketches}\n"
+    style_text = ""
+    if style:
+        examples = "\n".join(f"- {text}" for text in style)
+        style_text = f"How {nick} usually writes (copy the style, not the content):\n{examples}\n"
     draft_text = f'{nick} has started typing: "{draft}". Build on it.\n' if draft else ""
     answer = await llm.chat(
         p.SUGGEST_SYSTEM.format(nick=nick, n=n),
         p.SUGGEST_USER.format(channel=channel, topic=topic or "(none)", profiles=profile_text,
-                              log=render_log(lines), draft=draft_text, nick=nick, n=n),
+                              style=style_text, log=render_log(lines), draft=draft_text,
+                              nick=nick, n=n),
         max_tokens=60 * n + 40)
     return parse_options(answer, nick, n)
 

@@ -78,6 +78,7 @@ class IRCApp(App):
         self.suggestions: list[str] = []
         self._suggest_cursor = -1
         self._suggest_pane: str | None = None
+        self._accepted: tuple[int, str] | None = None  # suggestion put into the input
         self._rephrase_original: str | None = None
         self._triage_queue: dict[str, list[Line]] = {}
 
@@ -200,6 +201,7 @@ class IRCApp(App):
                 self.store.set_read_marker(prev.network, prev.buffer_name, prev.last_db_id)
         self._active_id = pane.id
         self.input.value = self._drafts.get(pane.id, "")
+        self._accepted = None
         self.clear_suggestions()
         self.scheduler.cancel("suggest")
 
@@ -360,18 +362,31 @@ class IRCApp(App):
               and self.cfg.features.llm_triage and features.looks_like_question(msg.text)):
             self.queue_triage(pane, line)
 
+    @on(Input.Changed, "#input")
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # The current value, not event.value: a late event from the last submit must
+        # not undo a suggestion accepted since.
+        if not self.input.value:
+            self._accepted = None
+
     @on(Input.Submitted, "#input")
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value
+        # Captured before sending, which clears the suggestions.
+        accepted, shown = self._accepted, list(self.suggestions)
+        rephrased = self._rephrase_original is not None
         self.input.value = ""
         self._rephrase_original = None
+        self._accepted = None
         pane = self.active_buffer()
         if pane is None or not value.strip():
             return
         try:
             cmd = c.parse_input(value)
             if cmd is None:
-                self.send_text(pane, c.plain_text(value))
+                text = c.plain_text(value)
+                self.send_text(pane, text)
+                self._record_suggestion(pane, text, accepted, shown, rephrased)
             else:
                 await self.run_command(pane, cmd)
         except c.CommandError as exc:
@@ -471,6 +486,8 @@ class IRCApp(App):
                 gone = self.store.forget_profile(net, cmd.args[0])
                 pane.write_info(f"Profile for {cmd.args[0]} "
                                 f"{'deleted' if gone else 'not found'}.")
+            case "stats":
+                pane.write_info(self._suggestion_stats(net))
             case "llm":
                 self.run_worker(self.connect_llm(), group="llm")
             case "help":
@@ -557,7 +574,8 @@ class IRCApp(App):
                 topic=chan.topic if chan else "", lines=lines,
                 n=self.cfg.features.suggestion_count,
                 draft=self.input.value.strip() if priority == Priority.USER else "",
-                profiles=self._profiles_for(pane.network, lines))
+                profiles=self._profiles_for(pane.network, lines),
+                style=self._style_examples(pane, lines))
 
         future = self.scheduler.submit(priority, job, key="suggest", delay=delay)
 
@@ -590,6 +608,14 @@ class IRCApp(App):
                 lines_ = [ln.strip() for ln in prof.profile.splitlines() if ln.strip()]
                 sketches[nick] = " ".join(lines_[:2])[:250]
         return sketches
+
+    def _style_examples(self, pane: ChatBuffer, lines: list[Line]) -> list[str]:
+        n = self.cfg.features.style_examples
+        if n <= 0:
+            return []
+        rows = self.store.own_messages(pane.network, n * 3, pane.buffer_name)
+        return features.style_examples((row.text for row in rows), n,
+                                       exclude=[line.text for line in lines])
 
     def show_bar(self, content: Text) -> None:
         self.bar.update(content)
@@ -633,6 +659,7 @@ class IRCApp(App):
         if index >= len(self.suggestions):
             raise SkipAction()
         self._suggest_cursor = index
+        self._accepted = (index, self.suggestions[index])
         self._put_input(self.suggestions[index])
 
     def action_tab_key(self) -> None:
@@ -642,6 +669,7 @@ class IRCApp(App):
         value = self.input.value
         if self.suggestions and (not value or value in self.suggestions):
             self._suggest_cursor = (self._suggest_cursor + 1) % len(self.suggestions)
+            self._accepted = (self._suggest_cursor, self.suggestions[self._suggest_cursor])
             self._put_input(self.suggestions[self._suggest_cursor])
             return
         self.complete_nick()
@@ -681,8 +709,41 @@ class IRCApp(App):
         if len(self.screen_stack) > 1 or (
                 not self.suggestions and not self.bar.has_class("visible")):
             raise SkipAction()  # let Escape close modals / reach other widgets
+        if self.suggestions and self._accepted is None and (pane := self.active_buffer()):
+            self.store.add_suggestion_event(pane.network, pane.buffer_name, "dismissed",
+                                            suggestion="\n".join(self.suggestions))
         self.scheduler.cancel("suggest")
         self.clear_suggestions()
+
+    def _record_suggestion(self, pane: ChatBuffer, text: str, accepted: tuple[int, str] | None,
+                           shown: list[str], rephrased: bool) -> None:
+        """Log how a sent line relates to the suggestions (for /stats and style examples).
+
+        pane.last_db_id is the sent line: sending stores it synchronously.
+        """
+        net, sent = pane.network, text.strip()
+        if accepted is not None:
+            index, option = accepted
+            self.store.add_suggestion_event(
+                net, pane.buffer_name, "picked" if sent == option else "edited",
+                index=index, suggestion=option, sent=sent, message_id=pane.last_db_id)
+        elif rephrased:
+            self.store.add_suggestion_event(net, pane.buffer_name, "rephrased", sent=sent,
+                                            message_id=pane.last_db_id)
+        elif shown:
+            self.store.add_suggestion_event(net, pane.buffer_name, "ignored",
+                                            suggestion="\n".join(shown), sent=sent)
+
+    def _suggestion_stats(self, network: str) -> str:
+        stats = self.store.suggestion_stats(network)
+        if not stats:
+            return "No suggestion feedback yet."
+        counts = ", ".join(f"{stats.get(outcome, 0)} {outcome}" for outcome in
+                           ("picked", "edited", "dismissed", "ignored", "rephrased"))
+        used = stats.get("picked", 0) + stats.get("edited", 0)
+        shown = used + stats.get("dismissed", 0) + stats.get("ignored", 0)
+        rate = f" · used {used} of {shown} ({used * 100 // shown}%)" if shown else ""
+        return f"Suggestions on {network}: {counts}{rate}"
 
     # --- rephrase ---------------------------------------------------------------------
 

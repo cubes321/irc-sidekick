@@ -79,3 +79,36 @@ def test_newer_database_opens_unchanged(tmp_path):
     conn.close()
     Store(str(path)).close()
     assert user_version(path) == 99
+
+
+def test_own_messages_prefers_buffer_and_skips_private_and_llm_lines(tmp_path):
+    store = Store(str(tmp_path / "own.sqlite3"))
+    add = store.add_message
+    add("net", "#home", "me", "home line", "msg", True, 1.0)
+    add("net", "#other", "me", "other channel line", "msg", True, 2.0)
+    add("net", "NickServ", "me", "IDENTIFY me secret", "msg", True, 3.0)
+    add("net", "dave", "me", "private to dave", "msg", True, 4.0)
+    add("net", "#home", "bob", "not mine", "msg", False, 5.0)
+    add("net", "#home", "me", "waves", "action", True, 6.0)
+    picked = add("net", "#home", "me", "sounds good", "msg", True, 7.0)
+    add("net2", "#home", "me", "other network", "msg", True, 8.0)
+    store.add_suggestion_event("net", "#home", "picked", index=0, suggestion="sounds good",
+                               sent="sounds good", message_id=picked)
+
+    assert [m.text for m in store.own_messages("net", 10, "#Home")] == [
+        "home line", "other channel line"]
+    # In a query tab, that conversation's own lines come first; other queries stay out.
+    assert [m.text for m in store.own_messages("net", 10, "dave")] == [
+        "private to dave", "other channel line", "home line"]
+    assert [m.text for m in store.own_messages("net", 1, "#other")] == ["other channel line"]
+    store.close()
+
+
+def test_suggestion_stats(tmp_path):
+    store = Store(str(tmp_path / "stats.sqlite3"))
+    for outcome in ("picked", "picked", "dismissed", "ignored"):
+        store.add_suggestion_event("net", "#c", outcome)
+    store.add_suggestion_event("other", "#c", "edited")
+    assert store.suggestion_stats("net") == {"picked": 2, "dismissed": 1, "ignored": 1}
+    assert store.suggestion_stats("nowhere") == {}
+    store.close()

@@ -40,3 +40,31 @@ def test_looks_like_question():
     assert f.looks_like_question("anyone know how to fix this")
     assert f.looks_like_question("it broke?")
     assert not f.looks_like_question("I fixed it.")
+
+
+def test_style_examples_filters_and_limits():
+    texts = ["ok", "lol yeah same", "LOL YEAH SAME", "already in the log", "x" * 200 + " y",
+             "honestly no idea mate", "one more line"]
+    picked = f.style_examples(texts, 3, exclude=["Already in the log"])
+    assert picked == ["lol yeah same", ("x" * 200 + " y")[:120], "honestly no idea mate"]
+    assert f.style_examples(texts, 0) == []
+
+
+class CapturingLLM:
+    def __init__(self):
+        self.user = ""
+
+    async def chat(self, system, user, **kwargs):
+        self.user = user
+        return "1. a\n2. b"
+
+
+async def test_suggest_includes_style_examples():
+    llm = CapturingLLM()
+    lines = [f.Line("bob", "the build broke?")]
+    await f.suggest(llm, nick="me", channel="#c", topic="", lines=lines, n=2,
+                    style=["lol yeah same"])
+    assert "How me usually writes" in llm.user
+    assert "- lol yeah same" in llm.user
+    await f.suggest(llm, nick="me", channel="#c", topic="", lines=lines, n=2)
+    assert "usually writes" not in llm.user

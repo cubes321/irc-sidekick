@@ -15,12 +15,14 @@ from tests.fake_ircd import FakeIRCd
 class FakeLLM:
     def __init__(self, cfg):
         self.calls: list[str] = []
+        self.prompts: list[str] = []
 
     async def discover(self):
         return "fake-model"
 
     async def chat(self, system, user, **kwargs):
         self.calls.append(system)
+        self.prompts.append(user)
         if "propose" in system:
             return "1. sounds good\n2. what happened?\n3. lol"
         if "rewrite" in system:
@@ -144,6 +146,61 @@ async def test_join_chat_suggest_part(ircd, tmp_path, monkeypatch):
         await wait_for(pilot, lambda: not second.joined)
         await type_line(pilot, app, "/close")
         await wait_for(pilot, lambda: app.find("fake", "#second") is None)
+
+
+async def test_style_examples_and_suggestion_feedback(ircd, tmp_path, monkeypatch):
+    server, port = ircd
+    monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)
+    app = IRCApp(make_config(port, tmp_path))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await wait_for(pilot, lambda: app.find("fake", "#home") is not None
+                       and app.find("fake", "#home").joined)
+        app.tabs.active = app.find("fake", "#home").id
+        await pilot.pause(0.1)
+        await type_line(pilot, app, "honestly no idea mate")
+        await type_line(pilot, app, "/join #second")
+        await wait_for(pilot, lambda: app.find("fake", "#second") is not None
+                       and app.active_buffer() is app.find("fake", "#second"))
+
+        def events():
+            return app.store.db.execute(
+                "SELECT outcome, message_id FROM suggestion_events ORDER BY id").fetchall()
+
+        async def bob_asks(text):
+            server.inject(f":bob!b@h PRIVMSG #second :{text}")
+            await wait_for(pilot, lambda: app.suggestions)
+
+        # Your own line from #home reaches the prompt as a style example.
+        server.inject(":bob!b@h JOIN #second")
+        await bob_asks("hey me, the build broke?")
+        suggest_prompts = [p for p in app.llm.prompts if "Suggest" in p]
+        assert "- honestly no idea mate" in suggest_prompts[-1]
+
+        await pilot.press("f6")
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: len(events()) == 1)
+        sent_id = app.store.recent("fake", "#second", 1)[-1].id
+        assert events()[-1] == ("picked", sent_id)
+        # The LLM-written line doesn't become a style example itself.
+        assert "sounds good" not in [m.text for m in app.store.own_messages("fake", 10)]
+
+        await bob_asks("anyone?")
+        await pilot.press("escape")
+        assert events()[-1] == ("dismissed", None)
+
+        await bob_asks("still broken")
+        await pilot.press("f6")
+        app.input.value += " ok"
+        await pilot.press("enter")
+        await wait_for(pilot, lambda: events()[-1][0] == "edited")
+
+        await bob_asks("hello?")
+        await type_line(pilot, app, "my own words")
+        await wait_for(pilot, lambda: events()[-1] == ("ignored", None))
+
+        await type_line(pilot, app, "/stats")
+        await wait_for(pilot, lambda: "1 picked, 1 edited, 1 dismissed, 1 ignored"
+                       in log_text(app.find("fake", "#second")))
 
 
 async def test_query_and_translate(ircd, tmp_path, monkeypatch):

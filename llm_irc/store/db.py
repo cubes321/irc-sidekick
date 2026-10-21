@@ -46,6 +46,22 @@ CREATE TABLE IF NOT EXISTS profiles (
 # returning SQL. Step 1's IF NOT EXISTS lets databases from before versioning pass.
 MIGRATIONS: list = [
     SCHEMA,
+    """
+    -- How reply suggestions get used. message_id marks sent lines the LLM wrote.
+    CREATE TABLE IF NOT EXISTS suggestion_events (
+        id INTEGER PRIMARY KEY,
+        network TEXT NOT NULL,
+        buffer TEXT NOT NULL,
+        ts REAL NOT NULL,
+        option_index INTEGER,
+        outcome TEXT NOT NULL,     -- picked | edited | rephrased | dismissed | ignored
+        suggestion TEXT NOT NULL DEFAULT '',
+        sent_text TEXT NOT NULL DEFAULT '',
+        message_id INTEGER
+    );
+    -- Own lines are a small share of the log; keeps the style-example query cheap.
+    CREATE INDEX IF NOT EXISTS idx_messages_own ON messages(network, id) WHERE own = 1;
+    """,
 ]
 
 
@@ -128,6 +144,41 @@ class Store:
             "ORDER BY id DESC LIMIT ?",
             (network, nick, limit)).fetchall()
         return [_row(r) for r in reversed(rows)]
+
+    def own_messages(self, network: str, limit: int, buffer: str = "") -> list[StoredMessage]:
+        """Lines the user typed themselves, newest first: this buffer first, then channels.
+
+        Other private chats stay out (they may hold /msg NickServ passwords), and so do
+        sent lines the LLM wrote (accepted or rephrased suggestions).
+        """
+        key = irc_lower(buffer)
+        rows = self.db.execute(
+            "SELECT id, buffer, nick, text, kind, own, ts FROM messages "
+            "WHERE network = ? AND own = 1 AND kind = 'msg' "
+            "AND (buffer = ? OR substr(buffer, 1, 1) IN ('#', '&')) "
+            "AND id NOT IN (SELECT message_id FROM suggestion_events "
+            "WHERE message_id IS NOT NULL) "
+            "ORDER BY buffer = ? DESC, id DESC LIMIT ?",
+            (network, key, key, limit)).fetchall()
+        return [_row(r) for r in rows]
+
+    # --- suggestion feedback ---
+
+    def add_suggestion_event(self, network: str, buffer: str, outcome: str, *,
+                             index: int | None = None, suggestion: str = "", sent: str = "",
+                             message_id: int | None = None) -> None:
+        self.db.execute(
+            "INSERT INTO suggestion_events (network, buffer, ts, option_index, outcome, "
+            "suggestion, sent_text, message_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (network, irc_lower(buffer), time.time(), index, outcome, suggestion, sent,
+             message_id))
+        self.db.commit()
+
+    def suggestion_stats(self, network: str) -> dict[str, int]:
+        rows = self.db.execute(
+            "SELECT outcome, COUNT(*) FROM suggestion_events WHERE network = ? "
+            "GROUP BY outcome", (network,)).fetchall()
+        return dict(rows)
 
     # --- read markers ---
 

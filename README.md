@@ -7,6 +7,8 @@ LLM (LM Studio) working in the background.
 - **Suggested replies**: after the channel goes quiet for a moment, 3 replies in the channel's
   tone appear above the input. `Tab` cycles them into the input, `F6`/`F7`/`F8` (or `Alt+1..3`) picks one. Nothing
   is sent until you press Enter. `Ctrl+Space`/`F2` asks right away and builds on your draft.
+  Your own recent lines are shown to the model so suggestions sound like you
+  (`features.style_examples`); `/stats` shows how often you use them.
 - **Catch-up summary**: `F5` or `/summary` summarizes what you missed in a tab
 - **Rephrase**: `Ctrl+R` makes your draft polite; `/rephrase concise|casual|formal|fix|lang:German`.
   `Ctrl+Z` undoes it.

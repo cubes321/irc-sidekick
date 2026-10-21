@@ -92,6 +92,7 @@ class FeatureConfig:
     translate_target: str = "English"
     profiles: bool = True
     profile_batch: int = 30
+    style_examples: int = 8
 
 
 @dataclass
