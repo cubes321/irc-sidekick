@@ -187,3 +187,19 @@ def test_around_and_excerpts(tmp_path):
     bridged = store.excerpts("net", [rows[0], rows[4], rows[2]], context=1)
     assert [len(window) for window in bridged] == [6]
     store.close()
+
+
+def test_ignores_survive_reopening(tmp_path):
+    path = str(tmp_path / "ignores.sqlite3")
+    store = Store(path)
+    assert store.add_ignore("net", "Troll")
+    assert not store.add_ignore("net", "troll")
+    store.add_ignore("net", "alice")
+    store.add_ignore("other", "bob")
+    store.close()
+    store = Store(path)
+    assert store.ignores("net") == ["alice", "Troll"]
+    assert store.remove_ignore("net", "TROLL")
+    assert not store.remove_ignore("net", "troll")
+    assert store.ignores("net") == ["alice"]
+    store.close()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import deque
 from functools import partial
 from typing import Any, Callable
 
@@ -58,6 +59,9 @@ class IRCApp(App):
         Binding("f5", "summary", "Catch up"),
         Binding("alt+right,ctrl+pagedown", "next_tab", "Next tab", show=False, priority=True),
         Binding("alt+left,ctrl+pageup", "prev_tab", "Prev tab", show=False, priority=True),
+        # Not priority: a focused chat log keeps Up/Down for scrolling.
+        Binding("up", "history(-1)", show=False),
+        Binding("down", "history(1)", show=False),
         Binding("ctrl+q", "quit_client", "Quit", priority=True),
     ]
 
@@ -72,6 +76,10 @@ class IRCApp(App):
         self._drafts: dict[str, str] = {}
         self._focus_on_join: set[tuple[str, str]] = set()
         self._closing: set[tuple[str, str]] = set()
+        # Input history: in memory only, as it may hold /msg NickServ passwords.
+        self._sent: deque[str] = deque(maxlen=100)
+        self._history_pos: int | None = None
+        self._history_draft = ""
         # LLM
         self.llm: LLMProvider | None = None
         self.llm_ready = False
@@ -102,6 +110,7 @@ class IRCApp(App):
     def on_mount(self) -> None:
         for net in self.cfg.networks:
             client = IRCClient(net, partial(self.handle_irc_event, net.name))
+            client.ignored = {irc_lower(nick) for nick in self.store.ignores(net.name)}
             self.clients[net.name] = client
             self.ensure_buffer(net.name, net.name, "status", focus=True)
             self.run_worker(client.run(), name=f"irc:{net.name}", group="irc")
@@ -149,7 +158,10 @@ class IRCApp(App):
 
     def _load_backlog(self, pane: ChatBuffer) -> None:
         rows = self.store.recent(pane.network, pane.buffer_name, BACKLOG_LINES)
+        ignored = self.clients[pane.network].ignored
         for row in rows:
+            if irc_lower(row.nick) in ignored:
+                continue  # stored before the /ignore
             pane.write_chat(row.nick, row.text, row.kind, own=row.own, ts=row.ts)
             pane.history.append(Line(row.nick, row.text, row.kind, row.ts))
         if rows:
@@ -177,6 +189,8 @@ class IRCApp(App):
         parts = []
         if pane is not None and (client := self.clients.get(pane.network)):
             state = "connected" if client.connected else "offline"
+            if client.away:
+                state += ", away"
             parts.append(f"{pane.network} as {client.state.nick} ({state})")
         llm = f"LLM: {self.llm_status}"
         if self.llm_ready:
@@ -204,6 +218,7 @@ class IRCApp(App):
         self._active_id = pane.id
         self.input.value = self._drafts.get(pane.id, "")
         self._accepted = None
+        self._history_pos = None
         self.clear_suggestions()
         self.scheduler.cancel("suggest")
 
@@ -284,6 +299,17 @@ class IRCApp(App):
                     pane.set_topic(topic)
                     if by:
                         pane.write_info(f"{by} changed the topic to: {topic}")
+            case ev.ModeChanged(channel=channel, by=by, modes=modes):
+                if pane := self.find(network, channel):
+                    pane.write_info(f"{by} sets mode {modes}")
+            case ev.WhoisReply(nick=nick, lines=lines):
+                # Their query tab, else the tab you're in (if on this network).
+                active = self.active_buffer()
+                target = self.find(network, nick) or (
+                    active if active is not None and active.network == network else status)
+                target.write_info(f"── whois {nick} ──", style="bold cyan")
+                for line in lines or ["(no reply)"]:
+                    target.write_info(f"   {line}", style="")
         self._refresh_members(network, event)
         self.update_statusline()
 
@@ -306,7 +332,7 @@ class IRCApp(App):
 
     def _refresh_members(self, network: str, event: ev.Event) -> None:
         names: list[str] = []
-        if isinstance(event, (ev.Joined, ev.Parted, ev.Kicked, ev.NamesUpdated)):
+        if isinstance(event, (ev.Joined, ev.Parted, ev.Kicked, ev.NamesUpdated, ev.ModeChanged)):
             names = [event.channel]
         elif isinstance(event, (ev.UserQuit, ev.NickChanged)):
             names = event.channels
@@ -380,6 +406,9 @@ class IRCApp(App):
         self.input.value = ""
         self._rephrase_original = None
         self._accepted = None
+        self._history_pos = None
+        if value.strip() and (not self._sent or self._sent[-1] != value):
+            self._sent.append(value)  # before parsing, so a mistyped command can be fixed
         pane = self.active_buffer()
         if pane is None or not value.strip():
             return
@@ -459,6 +488,38 @@ class IRCApp(App):
                     client.part(pane.buffer_name, cmd.rest)
                 else:
                     self.remove_buffer(pane)
+            case "away":
+                if not client.connected:
+                    raise c.CommandError("Not connected.")
+                client.set_away(cmd.rest)
+                pane.write_info(f"You are now away: {cmd.rest}" if cmd.rest else "You are back.")
+            case "whois":
+                if cmd.args:
+                    client.whois(cmd.args[0])
+                elif pane.kind == "query":
+                    client.whois(pane.buffer_name)
+                else:
+                    c.require(cmd, 1)
+            case "ignore":
+                if not cmd.args:
+                    names = self.store.ignores(net)
+                    pane.write_info(f"Ignoring: {', '.join(names)}" if names
+                                    else "You're not ignoring anyone.")
+                elif client.state.is_me(cmd.args[0]):
+                    raise c.CommandError("You can't ignore yourself.")
+                else:
+                    nick = cmd.args[0]
+                    self.store.add_ignore(net, nick)
+                    client.ignored.add(irc_lower(nick))
+                    pane.write_info(f"Ignoring {nick}: their messages are hidden and not stored. "
+                                    f"/unignore {nick} to undo.")
+            case "unignore":
+                c.require(cmd, 1)
+                nick = cmd.args[0]
+                client.ignored.discard(irc_lower(nick))
+                gone = self.store.remove_ignore(net, nick)
+                pane.write_info(f"No longer ignoring {nick}." if gone
+                                else f"{nick} wasn't being ignored.")
             case "auth":
                 client.login()
             case "raw":
@@ -505,8 +566,9 @@ class IRCApp(App):
                     for text in c.HELP.values():
                         pane.write_info("  " + text, style="")
                     pane.write_info("Keys: Ctrl+Space/F2 suggest · Tab, F6-F8 or Alt+1-3 use suggestion "
-                                    "or complete nick · Ctrl+R rephrase · Ctrl+Z undo rephrase · "
-                                    "F5 catch-up · Alt+←/→ switch tabs · Ctrl+Q quit", style="")
+                                    "or complete nick · ↑/↓ input history · Ctrl+R rephrase · "
+                                    "Ctrl+Z undo rephrase · F5 catch-up · Alt+←/→ switch tabs · "
+                                    "Ctrl+Q quit", style="")
             case _:
                 raise c.CommandError(f"Unknown command /{cmd.name}. Try /help.")
 
@@ -705,6 +767,25 @@ class IRCApp(App):
         rest = self.input.value[self.input.cursor_position:]
         self.input.value = new_value + rest
         self.input.cursor_position = len(new_value)
+
+    def action_history(self, step: int) -> None:
+        """Up/Down through sent lines; Down past the newest restores the draft."""
+        if not self.input.has_focus or not self._sent:
+            raise SkipAction()
+        if self._history_pos is None:
+            if step > 0:
+                raise SkipAction()
+            self._history_draft = self.input.value
+            pos = len(self._sent) - 1
+        else:
+            pos = max(0, self._history_pos + step)
+        if pos >= len(self._sent):
+            self._history_pos = None
+            self._put_input(self._history_draft)
+        else:
+            self._history_pos = pos
+            self._put_input(self._sent[pos])
+        self._accepted = None
 
     def _put_input(self, text: str) -> None:
         self.input.value = text

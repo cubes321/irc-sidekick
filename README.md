@@ -4,6 +4,9 @@ A terminal IRC client (Python + [Textual](https://textual.textualize.io/)) with 
 LLM (LM Studio) working in the background.
 
 - Tabs per network, channel and private chat; `/join`, `/part`, `/close` from inside the client
+- IRC basics: op/voice changes show live in the member list, `↑`/`↓` recall what you typed,
+  `/away`, `/whois`, and `/ignore nick` (saved; hides their messages and keeps them out of
+  the log and the LLM)
 - **Suggested replies**: after the channel goes quiet for a moment, 3 replies in the channel's
   tone appear above the input. `Tab` cycles them into the input, `F6`/`F7`/`F8` (or `Alt+1..3`) picks one. Nothing
   is sent until you press Enter. `Ctrl+Space`/`F2` asks right away and builds on your draft.

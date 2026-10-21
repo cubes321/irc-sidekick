@@ -84,6 +84,15 @@ MIGRATIONS: list = [
     CREATE INDEX IF NOT EXISTS idx_messages_own ON messages(network, id) WHERE own = 1;
     """,
     _fts_step,
+    """
+    CREATE TABLE IF NOT EXISTS ignores (
+        network TEXT NOT NULL,
+        nick_key TEXT NOT NULL,    -- irc_lower(nick)
+        nick TEXT NOT NULL,
+        added REAL NOT NULL,
+        PRIMARY KEY (network, nick_key)
+    );
+    """,
 ]
 
 
@@ -290,6 +299,26 @@ class Store:
             "SELECT outcome, COUNT(*) FROM suggestion_events WHERE network = ? "
             "GROUP BY outcome", (network,)).fetchall()
         return dict(rows)
+
+    # --- ignores ---
+
+    def add_ignore(self, network: str, nick: str) -> bool:
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO ignores (network, nick_key, nick, added) VALUES (?, ?, ?, ?)",
+            (network, irc_lower(nick), nick, time.time()))
+        self.db.commit()
+        return cur.rowcount > 0
+
+    def remove_ignore(self, network: str, nick: str) -> bool:
+        cur = self.db.execute("DELETE FROM ignores WHERE network = ? AND nick_key = ?",
+                              (network, irc_lower(nick)))
+        self.db.commit()
+        return cur.rowcount > 0
+
+    def ignores(self, network: str) -> list[str]:
+        rows = self.db.execute("SELECT nick FROM ignores WHERE network = ? ORDER BY nick_key",
+                               (network,)).fetchall()
+        return [r[0] for r in rows]
 
     # --- read markers ---
 

@@ -237,6 +237,134 @@ async def test_search_and_ask(ircd, tmp_path, monkeypatch):
         await wait_for(pilot, lambda: "Ask about something specific" in log_text(home))
 
 
+async def start(app, pilot) -> ChatBuffer:
+    """Wait for the autojoin of #home and select it."""
+    await wait_for(pilot, lambda: app.find("fake", "#home") is not None
+                   and app.find("fake", "#home").joined)
+    home = app.find("fake", "#home")
+    app.tabs.active = home.id
+    await pilot.pause(0.1)
+    return home
+
+
+async def test_mode_changes(ircd, tmp_path, monkeypatch):
+    server, port = ircd
+    monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)
+    app = IRCApp(make_config(port, tmp_path))
+    async with app.run_test(size=(120, 40)) as pilot:
+        home = await start(app, pilot)
+        chan = app.clients["fake"].state.channel("#home")
+
+        def bob():
+            return chan.members.get("bob", ("", "?"))[1]
+
+        server.inject(":bob!b@h JOIN #home")
+        await wait_for(pilot, lambda: bob() == "")
+        server.inject(":op!o@h MODE #home +lo 10 bob")  # 'l' takes its own argument
+        await wait_for(pilot, lambda: bob() == "@")
+        server.inject(":op!o@h MODE #home +v bob")
+        await wait_for(pilot, lambda: bob() == "@+")
+        server.inject(":op!o@h MODE #home -o bob")
+        await wait_for(pilot, lambda: bob() == "+")
+        assert "op sets mode +lo 10 bob" in log_text(home)
+        assert ("bob", "+") in chan.sorted_members()
+
+        server.inject(":me MODE me :+ix")
+        # Shown first: a RichLog that was never laid out holds its writes back.
+        status = app.status_pane("fake")
+        app.tabs.active = status.id
+        await wait_for(pilot, lambda: "Mode me +ix" in log_text(status))
+        assert app.is_running
+
+
+async def test_input_history(ircd, tmp_path, monkeypatch):
+    server, port = ircd
+    monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)
+    app = IRCApp(make_config(port, tmp_path))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await start(app, pilot)
+        await pilot.press("up")  # nothing sent yet
+        assert app.input.value == ""
+
+        await type_line(pilot, app, "one")
+        await type_line(pilot, app, "two")
+        await type_line(pilot, app, "two")  # repeats are kept once
+        app.input.value = "dra"
+        for key, expected in [("up", "two"), ("up", "one"), ("up", "one"),
+                              ("down", "two"), ("down", "dra"), ("down", "dra")]:
+            await pilot.press(key)
+            assert app.input.value == expected, key
+
+
+async def test_away_and_whois(ircd, tmp_path, monkeypatch):
+    server, port = ircd
+    monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)
+    app = IRCApp(make_config(port, tmp_path))
+    async with app.run_test(size=(120, 40)) as pilot:
+        home = await start(app, pilot)
+        client = app.clients["fake"]
+
+        await type_line(pilot, app, "/away gone fishing")
+        await wait_for(pilot, lambda: client.away)
+        assert "AWAY :gone fishing" in server.received
+        assert "away" in str(app.statusline.render())
+
+        await type_line(pilot, app, "/whois me")
+        await wait_for(pilot, lambda: "── whois me ──" in log_text(home))
+        await wait_for(pilot, lambda: "idle 2m 5s" in log_text(home))
+        text = log_text(home)
+        assert "me!me@localhost (Fake User)" in text
+        assert "channels: #home" in text and "away: gone fishing" in text
+
+        await type_line(pilot, app, "/away")
+        await wait_for(pilot, lambda: not client.away)
+        assert "AWAY" in server.received
+        await type_line(pilot, app, "/whois ghost")
+        await wait_for(pilot, lambda: "no such nick" in log_text(home))
+
+        # A 301 shows once in the query tab, not on every message.
+        server.away["bob"] = "lunch"
+        await type_line(pilot, app, "/query bob hi")
+        await wait_for(pilot, lambda: app.active_buffer() is app.find("fake", "bob"))
+        bob = app.find("fake", "bob")
+        await type_line(pilot, app, "again")
+        await type_line(pilot, app, "/whois")  # defaults to the query's nick; also a sync point
+        await wait_for(pilot, lambda: "── whois bob ──" in log_text(bob))
+        await wait_for(pilot, lambda: "away: lunch" in log_text(bob))
+        assert log_text(bob).count("bob is away: lunch") == 1
+
+
+async def test_ignore(ircd, tmp_path, monkeypatch):
+    server, port = ircd
+    monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)
+    app = IRCApp(make_config(port, tmp_path))
+    async with app.run_test(size=(120, 40)) as pilot:
+        home = await start(app, pilot)
+        await type_line(pilot, app, "/ignore troll")
+        server.inject(":troll!t@h PRIVMSG #home :buy my stuff")
+        server.inject(":troll!t@h PRIVMSG me :psst")
+        server.inject(":troll!t@h PRIVMSG me :\x01VERSION\x01")
+        server.inject(":bob!b@h PRIVMSG #home :sync")
+        await wait_for(pilot, lambda: "sync" in log_text(home))
+        assert "buy my stuff" not in log_text(home)
+        assert [m.nick for m in app.store.recent("fake", "#home", 50)] == ["bob"]
+        assert app.find("fake", "troll") is None
+        # The send queue is FIFO: once this arrives, a CTCP reply would have too.
+        await type_line(pilot, app, "/raw PING marker")
+        await wait_for(pilot, lambda: "PING marker" in server.received)
+        assert not any(line.startswith("NOTICE troll") for line in server.received)
+
+        await type_line(pilot, app, "/ignore")
+        await wait_for(pilot, lambda: "Ignoring: troll" in log_text(home))
+        assert app.store.ignores("fake") == ["troll"]
+        await type_line(pilot, app, "/ignore ME")
+        await wait_for(pilot, lambda: "can't ignore yourself" in log_text(home))
+
+        await type_line(pilot, app, "/unignore troll")
+        server.inject(":troll!t@h PRIVMSG #home :i'm back")
+        await wait_for(pilot, lambda: "i'm back" in log_text(home))
+
+
 async def test_query_and_translate(ircd, tmp_path, monkeypatch):
     server, port = ircd
     monkeypatch.setattr(app_module, "LLMProvider", FakeLLM)
