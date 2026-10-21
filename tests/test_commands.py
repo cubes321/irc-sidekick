@@ -24,3 +24,11 @@ def test_require():
 def test_every_command_has_help():
     for alias, target in c.ALIASES.items():
         assert target in c.HELP
+
+
+def test_split_scope():
+    assert c.split_scope("-all foo bar", "#here") == (None, "foo bar")
+    assert c.split_scope("#chan foo", None) == ("#chan", "foo")
+    assert c.split_scope("foo bar", "#here") == ("#here", "foo bar")
+    assert c.split_scope("# foo", "#here") == ("#here", "# foo")
+    assert c.split_scope("", None) == (None, "")

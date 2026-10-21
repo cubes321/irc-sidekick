@@ -18,14 +18,15 @@ class Line:
     kind: str = "msg"
     ts: float = 0.0
 
-    def render(self) -> str:
-        stamp = time.strftime("%H:%M", time.localtime(self.ts)) if self.ts else ""
+    def render(self, dates: bool = False) -> str:
+        fmt = "%Y-%m-%d %H:%M" if dates else "%H:%M"
+        stamp = time.strftime(fmt, time.localtime(self.ts)) if self.ts else ""
         body = f"* {self.nick} {self.text}" if self.kind == "action" else f"<{self.nick}> {self.text}"
         return f"[{stamp}] {body}" if stamp else body
 
 
-def render_log(lines: Iterable[Line]) -> str:
-    return "\n".join(line.render() for line in lines) or "(no messages yet)"
+def render_log(lines: Iterable[Line], dates: bool = False) -> str:
+    return "\n".join(line.render(dates) for line in lines) or "(no messages yet)"
 
 
 _NUMBERING = re.compile(r"^\s*(?:\d+[.):]|[-*•])\s*")
@@ -45,18 +46,39 @@ def parse_options(text: str, own_nick: str, limit: int) -> list[str]:
     return options[:limit]
 
 
+def style_examples(texts: Iterable[str], n: int, exclude: Iterable[str] = ()) -> list[str]:
+    """Up to `n` of the user's own lines worth showing the model as style examples."""
+    seen = {text.strip().lower() for text in exclude}
+    picked = []
+    for text in texts:
+        text = text.strip()
+        if len(picked) >= n:
+            break
+        if len(text.split()) < 2 or text.lower() in seen:
+            continue  # one-word lines say little about style; context lines are already shown
+        seen.add(text.lower())
+        picked.append(text[:120])
+    return picked
+
+
 async def suggest(llm: LLMProvider, *, nick: str, channel: str, topic: str,
                   lines: list[Line], n: int, draft: str = "",
-                  profiles: dict[str, str] | None = None) -> list[str]:
+                  profiles: dict[str, str] | None = None,
+                  style: list[str] | None = None) -> list[str]:
     profile_text = ""
     if profiles:
         sketches = "\n".join(f"- {who}: {sketch}" for who, sketch in profiles.items())
         profile_text = f"What you know about the people talking:\n{sketches}\n"
+    style_text = ""
+    if style:
+        examples = "\n".join(f"- {text}" for text in style)
+        style_text = f"How {nick} usually writes (copy the style, not the content):\n{examples}\n"
     draft_text = f'{nick} has started typing: "{draft}". Build on it.\n' if draft else ""
     answer = await llm.chat(
         p.SUGGEST_SYSTEM.format(nick=nick, n=n),
         p.SUGGEST_USER.format(channel=channel, topic=topic or "(none)", profiles=profile_text,
-                              log=render_log(lines), draft=draft_text, nick=nick, n=n),
+                              style=style_text, log=render_log(lines), draft=draft_text,
+                              nick=nick, n=n),
         max_tokens=60 * n + 40)
     return parse_options(answer, nick, n)
 
@@ -105,6 +127,17 @@ async def translate(llm: LLMProvider, *, text: str, target: str) -> str | None:
     return answer
 
 
+async def ask(llm: LLMProvider, *, nick: str, question: str,
+              excerpts: list[tuple[str, list[Line]]]) -> str:
+    """Answer a question about the past from log excerpts, given as (buffer, lines)."""
+    text = "\n\n".join(f"--- {buffer} ---\n{render_log(lines, dates=True)}"
+                       for buffer, lines in excerpts)
+    return await llm.chat(
+        p.ASK_SYSTEM.format(nick=nick),
+        p.ASK_USER.format(excerpts=text, nick=nick, question=question),
+        max_tokens=300, temperature=0.2)
+
+
 async def update_profile(llm: LLMProvider, *, nick: str, previous: str,
                          lines: list[Line]) -> str:
     return await llm.chat(
@@ -125,6 +158,28 @@ _COMMON_FOREIGN = {"el", "los", "las", "es", "por", "para", "qué", "que", "est�
                    "der", "die", "das", "und", "ist", "nicht", "ich", "mit", "auch", "ein",
                    "eine", "che", "sono", "non", "della", "não", "uma", "com", "het", "een",
                    "niet", "zijn", "ik"}
+
+
+# Words that carry no search value in a question about the log (kept apart from
+# _COMMON_EN so the language guess is unaffected).
+_QUESTION_WORDS = {"when", "where", "who", "which", "did", "does", "about", "said", "say",
+                   "says", "anyone", "someone", "anybody", "there", "they", "them", "were",
+                   "will", "would", "could", "should", "has", "had", "we", "our", "he",
+                   "she", "his", "her", "an", "or", "if", "at", "by", "as", "any", "all",
+                   "ever", "talk", "talked", "mention", "mentioned", "tell", "told", "know",
+                   "from", "last", "been", "their", "then", "than", "into", "out",
+                   "get", "got", "think", "thought", "something", "anything", "me", "us"}
+
+
+def keywords(text: str, limit: int = 8) -> list[str]:
+    """Search terms from a question: words left after dropping common ones, in order."""
+    words = []
+    for word in re.findall(r"[^\W_]+", text.lower()):
+        if word in _COMMON_EN or word in _QUESTION_WORDS or word in words:
+            continue
+        if len(word) >= 3 or word.isdigit():
+            words.append(word)
+    return words[:limit]
 
 
 def looks_foreign(text: str, target: str) -> bool:

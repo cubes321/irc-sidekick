@@ -4,10 +4,18 @@ A terminal IRC client (Python + [Textual](https://textual.textualize.io/)) with 
 LLM (LM Studio) working in the background.
 
 - Tabs per network, channel and private chat; `/join`, `/part`, `/close` from inside the client
+- IRC basics: op/voice changes show live in the member list, `↑`/`↓` recall what you typed,
+  `/away`, `/whois`, and `/ignore nick` (saved; hides their messages and keeps them out of
+  the log and the LLM)
 - **Suggested replies**: after the channel goes quiet for a moment, 3 replies in the channel's
   tone appear above the input. `Tab` cycles them into the input, `F6`/`F7`/`F8` (or `Alt+1..3`) picks one. Nothing
   is sent until you press Enter. `Ctrl+Space`/`F2` asks right away and builds on your draft.
+  Your own recent lines are shown to the model so suggestions sound like you
+  (`features.style_examples`); `/stats` shows how often you use them.
 - **Catch-up summary**: `F5` or `/summary` summarizes what you missed in a tab
+- **Search & ask**: `/search release friday` finds logged messages (this tab; `#chan` or
+  `-all` to widen). `/ask when is the release?` has the LLM answer from matching log
+  excerpts, citing dates, and says so when the log doesn't cover it.
 - **Rephrase**: `Ctrl+R` makes your draft polite; `/rephrase concise|casual|formal|fix|lang:German`.
   `Ctrl+Z` undoes it.
 - **Mention triage**: your nick and `triage_keywords` highlight instantly. In background tabs the
@@ -20,11 +28,32 @@ LLM (LM Studio) working in the background.
 
 ## Setup
 
+Install into a virtual environment, so the client's packages stay out of your system Python.
+
+Windows (PowerShell or cmd):
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e .[dev]
+copy config.example.toml config.toml
+python -m llm_irc
+```
+
+Linux / macOS:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .[dev]
 cp config.example.toml config.toml   # then set your nick and channels
 python -m llm_irc                    # or: python -m llm_irc -c other.toml
 ```
+
+Edit `config.toml` to set your nick and channels before starting; to use another config,
+run `python -m llm_irc -c other.toml`. Activate the venv again in each new terminal. If
+PowerShell refuses to run the activate script, skip it and start the client with
+`.venv\Scripts\python -m llm_irc`.
 
 Start LM Studio's local server (default `http://localhost:1234`) with a chat model loaded.
 The client uses whichever model is **loaded**, unless `llm.model` names one. If LM Studio is

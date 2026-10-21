@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import deque
 from functools import partial
 from typing import Any, Callable
 
@@ -28,6 +29,8 @@ from .profile_view import ProfileScreen
 
 STATUS_KEY = "\x00status"
 BACKLOG_LINES = 40
+SEARCH_LIMIT = 20
+ASK_HITS, ASK_CONTEXT, ASK_MAX_LINES = 12, 3, 60  # matches, lines around each, total cap
 
 
 class IRCApp(App):
@@ -56,6 +59,9 @@ class IRCApp(App):
         Binding("f5", "summary", "Catch up"),
         Binding("alt+right,ctrl+pagedown", "next_tab", "Next tab", show=False, priority=True),
         Binding("alt+left,ctrl+pageup", "prev_tab", "Prev tab", show=False, priority=True),
+        # Not priority: a focused chat log keeps Up/Down for scrolling.
+        Binding("up", "history(-1)", show=False),
+        Binding("down", "history(1)", show=False),
         Binding("ctrl+q", "quit_client", "Quit", priority=True),
     ]
 
@@ -70,6 +76,10 @@ class IRCApp(App):
         self._drafts: dict[str, str] = {}
         self._focus_on_join: set[tuple[str, str]] = set()
         self._closing: set[tuple[str, str]] = set()
+        # Input history: in memory only, as it may hold /msg NickServ passwords.
+        self._sent: deque[str] = deque(maxlen=100)
+        self._history_pos: int | None = None
+        self._history_draft = ""
         # LLM
         self.llm: LLMProvider | None = None
         self.llm_ready = False
@@ -78,6 +88,7 @@ class IRCApp(App):
         self.suggestions: list[str] = []
         self._suggest_cursor = -1
         self._suggest_pane: str | None = None
+        self._accepted: tuple[int, str] | None = None  # suggestion put into the input
         self._rephrase_original: str | None = None
         self._triage_queue: dict[str, list[Line]] = {}
 
@@ -99,6 +110,7 @@ class IRCApp(App):
     def on_mount(self) -> None:
         for net in self.cfg.networks:
             client = IRCClient(net, partial(self.handle_irc_event, net.name))
+            client.ignored = {irc_lower(nick) for nick in self.store.ignores(net.name)}
             self.clients[net.name] = client
             self.ensure_buffer(net.name, net.name, "status", focus=True)
             self.run_worker(client.run(), name=f"irc:{net.name}", group="irc")
@@ -146,7 +158,10 @@ class IRCApp(App):
 
     def _load_backlog(self, pane: ChatBuffer) -> None:
         rows = self.store.recent(pane.network, pane.buffer_name, BACKLOG_LINES)
+        ignored = self.clients[pane.network].ignored
         for row in rows:
+            if irc_lower(row.nick) in ignored:
+                continue  # stored before the /ignore
             pane.write_chat(row.nick, row.text, row.kind, own=row.own, ts=row.ts)
             pane.history.append(Line(row.nick, row.text, row.kind, row.ts))
         if rows:
@@ -174,6 +189,8 @@ class IRCApp(App):
         parts = []
         if pane is not None and (client := self.clients.get(pane.network)):
             state = "connected" if client.connected else "offline"
+            if client.away:
+                state += ", away"
             parts.append(f"{pane.network} as {client.state.nick} ({state})")
         llm = f"LLM: {self.llm_status}"
         if self.llm_ready:
@@ -200,6 +217,8 @@ class IRCApp(App):
                 self.store.set_read_marker(prev.network, prev.buffer_name, prev.last_db_id)
         self._active_id = pane.id
         self.input.value = self._drafts.get(pane.id, "")
+        self._accepted = None
+        self._history_pos = None
         self.clear_suggestions()
         self.scheduler.cancel("suggest")
 
@@ -280,6 +299,17 @@ class IRCApp(App):
                     pane.set_topic(topic)
                     if by:
                         pane.write_info(f"{by} changed the topic to: {topic}")
+            case ev.ModeChanged(channel=channel, by=by, modes=modes):
+                if pane := self.find(network, channel):
+                    pane.write_info(f"{by} sets mode {modes}")
+            case ev.WhoisReply(nick=nick, lines=lines):
+                # Their query tab, else the tab you're in (if on this network).
+                active = self.active_buffer()
+                target = self.find(network, nick) or (
+                    active if active is not None and active.network == network else status)
+                target.write_info(f"── whois {nick} ──", style="bold cyan")
+                for line in lines or ["(no reply)"]:
+                    target.write_info(f"   {line}", style="")
         self._refresh_members(network, event)
         self.update_statusline()
 
@@ -302,7 +332,7 @@ class IRCApp(App):
 
     def _refresh_members(self, network: str, event: ev.Event) -> None:
         names: list[str] = []
-        if isinstance(event, (ev.Joined, ev.Parted, ev.Kicked, ev.NamesUpdated)):
+        if isinstance(event, (ev.Joined, ev.Parted, ev.Kicked, ev.NamesUpdated, ev.ModeChanged)):
             names = [event.channel]
         elif isinstance(event, (ev.UserQuit, ev.NickChanged)):
             names = event.channels
@@ -360,18 +390,34 @@ class IRCApp(App):
               and self.cfg.features.llm_triage and features.looks_like_question(msg.text)):
             self.queue_triage(pane, line)
 
+    @on(Input.Changed, "#input")
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # The current value, not event.value: a late event from the last submit must
+        # not undo a suggestion accepted since.
+        if not self.input.value:
+            self._accepted = None
+
     @on(Input.Submitted, "#input")
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value
+        # Captured before sending, which clears the suggestions.
+        accepted, shown = self._accepted, list(self.suggestions)
+        rephrased = self._rephrase_original is not None
         self.input.value = ""
         self._rephrase_original = None
+        self._accepted = None
+        self._history_pos = None
+        if value.strip() and (not self._sent or self._sent[-1] != value):
+            self._sent.append(value)  # before parsing, so a mistyped command can be fixed
         pane = self.active_buffer()
         if pane is None or not value.strip():
             return
         try:
             cmd = c.parse_input(value)
             if cmd is None:
-                self.send_text(pane, c.plain_text(value))
+                text = c.plain_text(value)
+                self.send_text(pane, text)
+                self._record_suggestion(pane, text, accepted, shown, rephrased)
             else:
                 await self.run_command(pane, cmd)
         except c.CommandError as exc:
@@ -442,6 +488,38 @@ class IRCApp(App):
                     client.part(pane.buffer_name, cmd.rest)
                 else:
                     self.remove_buffer(pane)
+            case "away":
+                if not client.connected:
+                    raise c.CommandError("Not connected.")
+                client.set_away(cmd.rest)
+                pane.write_info(f"You are now away: {cmd.rest}" if cmd.rest else "You are back.")
+            case "whois":
+                if cmd.args:
+                    client.whois(cmd.args[0])
+                elif pane.kind == "query":
+                    client.whois(pane.buffer_name)
+                else:
+                    c.require(cmd, 1)
+            case "ignore":
+                if not cmd.args:
+                    names = self.store.ignores(net)
+                    pane.write_info(f"Ignoring: {', '.join(names)}" if names
+                                    else "You're not ignoring anyone.")
+                elif client.state.is_me(cmd.args[0]):
+                    raise c.CommandError("You can't ignore yourself.")
+                else:
+                    nick = cmd.args[0]
+                    self.store.add_ignore(net, nick)
+                    client.ignored.add(irc_lower(nick))
+                    pane.write_info(f"Ignoring {nick}: their messages are hidden and not stored. "
+                                    f"/unignore {nick} to undo.")
+            case "unignore":
+                c.require(cmd, 1)
+                nick = cmd.args[0]
+                client.ignored.discard(irc_lower(nick))
+                gone = self.store.remove_ignore(net, nick)
+                pane.write_info(f"No longer ignoring {nick}." if gone
+                                else f"{nick} wasn't being ignored.")
             case "auth":
                 client.login()
             case "raw":
@@ -463,6 +541,10 @@ class IRCApp(App):
                 pane.write_info(f"Translation into {self.cfg.features.translate_target} "
                                 f"{'on' if pane.translate else 'off'} for this tab.")
                 self.update_statusline()
+            case "search" | "ask":
+                default = None if pane.kind == "status" else pane.buffer_name
+                buffer, text = c.split_scope(cmd.rest, default)
+                (self.search if cmd.name == "search" else self.ask)(pane, buffer, text)
             case "profile":
                 c.require(cmd, 1)
                 self.show_profile(net, cmd.args[0])
@@ -471,6 +553,8 @@ class IRCApp(App):
                 gone = self.store.forget_profile(net, cmd.args[0])
                 pane.write_info(f"Profile for {cmd.args[0]} "
                                 f"{'deleted' if gone else 'not found'}.")
+            case "stats":
+                pane.write_info(self._suggestion_stats(net))
             case "llm":
                 self.run_worker(self.connect_llm(), group="llm")
             case "help":
@@ -482,8 +566,9 @@ class IRCApp(App):
                     for text in c.HELP.values():
                         pane.write_info("  " + text, style="")
                     pane.write_info("Keys: Ctrl+Space/F2 suggest · Tab, F6-F8 or Alt+1-3 use suggestion "
-                                    "or complete nick · Ctrl+R rephrase · Ctrl+Z undo rephrase · "
-                                    "F5 catch-up · Alt+←/→ switch tabs · Ctrl+Q quit", style="")
+                                    "or complete nick · ↑/↓ input history · Ctrl+R rephrase · "
+                                    "Ctrl+Z undo rephrase · F5 catch-up · Alt+←/→ switch tabs · "
+                                    "Ctrl+Q quit", style="")
             case _:
                 raise c.CommandError(f"Unknown command /{cmd.name}. Try /help.")
 
@@ -557,7 +642,8 @@ class IRCApp(App):
                 topic=chan.topic if chan else "", lines=lines,
                 n=self.cfg.features.suggestion_count,
                 draft=self.input.value.strip() if priority == Priority.USER else "",
-                profiles=self._profiles_for(pane.network, lines))
+                profiles=self._profiles_for(pane.network, lines),
+                style=self._style_examples(pane, lines))
 
         future = self.scheduler.submit(priority, job, key="suggest", delay=delay)
 
@@ -590,6 +676,14 @@ class IRCApp(App):
                 lines_ = [ln.strip() for ln in prof.profile.splitlines() if ln.strip()]
                 sketches[nick] = " ".join(lines_[:2])[:250]
         return sketches
+
+    def _style_examples(self, pane: ChatBuffer, lines: list[Line]) -> list[str]:
+        n = self.cfg.features.style_examples
+        if n <= 0:
+            return []
+        rows = self.store.own_messages(pane.network, n * 3, pane.buffer_name)
+        return features.style_examples((row.text for row in rows), n,
+                                       exclude=[line.text for line in lines])
 
     def show_bar(self, content: Text) -> None:
         self.bar.update(content)
@@ -633,6 +727,7 @@ class IRCApp(App):
         if index >= len(self.suggestions):
             raise SkipAction()
         self._suggest_cursor = index
+        self._accepted = (index, self.suggestions[index])
         self._put_input(self.suggestions[index])
 
     def action_tab_key(self) -> None:
@@ -642,6 +737,7 @@ class IRCApp(App):
         value = self.input.value
         if self.suggestions and (not value or value in self.suggestions):
             self._suggest_cursor = (self._suggest_cursor + 1) % len(self.suggestions)
+            self._accepted = (self._suggest_cursor, self.suggestions[self._suggest_cursor])
             self._put_input(self.suggestions[self._suggest_cursor])
             return
         self.complete_nick()
@@ -672,6 +768,25 @@ class IRCApp(App):
         self.input.value = new_value + rest
         self.input.cursor_position = len(new_value)
 
+    def action_history(self, step: int) -> None:
+        """Up/Down through sent lines; Down past the newest restores the draft."""
+        if not self.input.has_focus or not self._sent:
+            raise SkipAction()
+        if self._history_pos is None:
+            if step > 0:
+                raise SkipAction()
+            self._history_draft = self.input.value
+            pos = len(self._sent) - 1
+        else:
+            pos = max(0, self._history_pos + step)
+        if pos >= len(self._sent):
+            self._history_pos = None
+            self._put_input(self._history_draft)
+        else:
+            self._history_pos = pos
+            self._put_input(self._sent[pos])
+        self._accepted = None
+
     def _put_input(self, text: str) -> None:
         self.input.value = text
         self.input.cursor_position = len(text)
@@ -681,8 +796,41 @@ class IRCApp(App):
         if len(self.screen_stack) > 1 or (
                 not self.suggestions and not self.bar.has_class("visible")):
             raise SkipAction()  # let Escape close modals / reach other widgets
+        if self.suggestions and self._accepted is None and (pane := self.active_buffer()):
+            self.store.add_suggestion_event(pane.network, pane.buffer_name, "dismissed",
+                                            suggestion="\n".join(self.suggestions))
         self.scheduler.cancel("suggest")
         self.clear_suggestions()
+
+    def _record_suggestion(self, pane: ChatBuffer, text: str, accepted: tuple[int, str] | None,
+                           shown: list[str], rephrased: bool) -> None:
+        """Log how a sent line relates to the suggestions (for /stats and style examples).
+
+        pane.last_db_id is the sent line: sending stores it synchronously.
+        """
+        net, sent = pane.network, text.strip()
+        if accepted is not None:
+            index, option = accepted
+            self.store.add_suggestion_event(
+                net, pane.buffer_name, "picked" if sent == option else "edited",
+                index=index, suggestion=option, sent=sent, message_id=pane.last_db_id)
+        elif rephrased:
+            self.store.add_suggestion_event(net, pane.buffer_name, "rephrased", sent=sent,
+                                            message_id=pane.last_db_id)
+        elif shown:
+            self.store.add_suggestion_event(net, pane.buffer_name, "ignored",
+                                            suggestion="\n".join(shown), sent=sent)
+
+    def _suggestion_stats(self, network: str) -> str:
+        stats = self.store.suggestion_stats(network)
+        if not stats:
+            return "No suggestion feedback yet."
+        counts = ", ".join(f"{stats.get(outcome, 0)} {outcome}" for outcome in
+                           ("picked", "edited", "dismissed", "ignored", "rephrased"))
+        used = stats.get("picked", 0) + stats.get("edited", 0)
+        shown = used + stats.get("dismissed", 0) + stats.get("ignored", 0)
+        rate = f" · used {used} of {shown} ({used * 100 // shown}%)" if shown else ""
+        return f"Suggestions on {network}: {counts}{rate}"
 
     # --- rephrase ---------------------------------------------------------------------
 
@@ -759,16 +907,61 @@ class IRCApp(App):
                                        lines=lines),
             key=f"summary:{pane.id}")
 
-        def done(summary: str) -> None:
-            pane.write_info("── Catch-up summary ──", style="bold cyan")
-            for text in summary.splitlines():
-                if text.strip():
-                    # Models answer in Markdown; the terminal shows it raw.
-                    text = re.sub(r"^\s*[-*•]\s+", "• ", text.replace("**", ""))
-                    pane.log_view.write(Text("   " + text.replace("`", ""), style="cyan"))
-            pane.write_info("──────────────────────", style="bold cyan")
+        self._when_done(future, partial(self._write_answer, pane, "Catch-up summary"),
+                        lambda e: pane.write_error(f"Summary failed: {e}"))
 
-        self._when_done(future, done, lambda e: pane.write_error(f"Summary failed: {e}"))
+    def _write_answer(self, pane: ChatBuffer, title: str, answer: str) -> None:
+        pane.write_info(f"── {title} ──", style="bold cyan")
+        for text in answer.splitlines():
+            if text.strip():
+                # Models answer in Markdown; the terminal shows it raw.
+                text = re.sub(r"^\s*[-*•]\s+", "• ", text.replace("**", ""))
+                pane.log_view.write(Text("   " + text.replace("`", ""), style="cyan"))
+        pane.write_info("──────────────────────", style="bold cyan")
+
+    # --- search and ask ---------------------------------------------------------------
+
+    def search(self, pane: ChatBuffer, buffer: str | None, query: str) -> None:
+        words = query.split()
+        if not words:
+            raise c.CommandError(f"usage: {c.HELP['search']}")
+        rows = self.store.search(pane.network, words, buffer=buffer, limit=SEARCH_LIMIT)
+        where = buffer or "all tabs"
+        if not rows:
+            pane.write_info(f"No messages match '{query}' in {where}.")
+            return
+        more = " (newest shown)" if len(rows) == SEARCH_LIMIT else ""
+        pane.write_info(f"── {len(rows)} matches for '{query}' in {where}{more} ──",
+                        style="bold cyan")
+        for row in reversed(rows):
+            pane.write_found(row.ts, "" if buffer else row.buffer, row.nick, row.text,
+                             row.kind, words)
+
+    def ask(self, pane: ChatBuffer, buffer: str | None, question: str) -> None:
+        if not question:
+            raise c.CommandError(f"usage: {c.HELP['ask']}")
+        self._require_llm()
+        words = features.keywords(question)
+        if not words:
+            raise c.CommandError("Ask about something specific: a name, a word or a topic.")
+        hits = self.store.search(pane.network, words, buffer=buffer, limit=ASK_HITS,
+                                 match_any=True)
+        excerpts = self.store.excerpts(pane.network, hits, context=ASK_CONTEXT,
+                                       max_lines=ASK_MAX_LINES)
+        if not excerpts:
+            pane.write_info(f"Nothing in the log mentions {' or '.join(words)}.")
+            return
+        blocks = [(rows[0].buffer, [Line(r.nick, r.text, r.kind, r.ts) for r in rows])
+                  for rows in excerpts]
+        pane.write_info(f"Asking about {sum(len(rows) for rows in excerpts)} logged lines...",
+                        style="italic cyan")
+        nick = self.clients[pane.network].state.nick
+        future = self.scheduler.submit(
+            Priority.USER,
+            lambda: features.ask(self.llm, nick=nick, question=question, excerpts=blocks),
+            key=f"ask:{pane.id}")
+        self._when_done(future, partial(self._write_answer, pane, "Answer"),
+                        lambda e: pane.write_error(f"Ask failed: {e}"))
 
     # --- translation ------------------------------------------------------------------
 

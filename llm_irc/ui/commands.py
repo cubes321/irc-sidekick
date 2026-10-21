@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..irc.state import is_channel
+
 HELP = {
     "join": "/join #channel [key]  - join a channel",
     "part": "/part [#channel] [reason]  - leave a channel (default: current)",
@@ -12,6 +14,10 @@ HELP = {
     "nick": "/nick newnick  - change nickname",
     "topic": "/topic [text]  - show or set the channel topic",
     "close": "/close  - close the current tab (parts channels)",
+    "away": "/away [message]  - mark yourself away (no message: back)",
+    "whois": "/whois [nick]  - show who someone is (default: this query's nick)",
+    "ignore": "/ignore [nick]  - hide and don't store someone's messages (no nick: list)",
+    "unignore": "/unignore nick  - stop ignoring someone",
     "auth": "/auth  - retry the services login (Q or NickServ) from the config",
     "raw": "/raw LINE  - send a raw IRC line",
     "quit": "/quit [reason]  - disconnect and exit",
@@ -19,8 +25,11 @@ HELP = {
     "summary": "/summary  - summarize unread messages in this tab",
     "rephrase": "/rephrase [polite|concise|casual|formal|lang:<language>]  - rewrite your draft (Ctrl+R)",
     "translate": "/translate [on|off]  - toggle translating foreign messages in this tab",
+    "search": "/search [#channel|-all] words  - find logged messages (default: this tab)",
+    "ask": "/ask [#channel|-all] question  - answer a question from the logged history",
     "profile": "/profile nick  - show the LLM's profile of a user",
     "forget": "/forget nick  - delete a stored user profile",
+    "stats": "/stats  - how often you use the reply suggestions",
     "llm": "/llm  - reconnect to LM Studio",
     "help": "/help [command]  - list commands",
 }
@@ -67,3 +76,13 @@ def split_first(rest: str) -> tuple[str, str]:
     """'nick some text' -> ('nick', 'some text')."""
     first, _, remainder = rest.partition(" ")
     return first, remainder.strip()
+
+
+def split_scope(rest: str, default: str | None) -> tuple[str | None, str]:
+    """'-all words' -> (None, 'words'); '#chan words' -> ('#chan', 'words'); else default."""
+    first, remainder = split_first(rest)
+    if first == "-all":
+        return None, remainder
+    if is_channel(first) and len(first) > 1:
+        return first, remainder
+    return default, rest.strip()

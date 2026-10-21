@@ -1,7 +1,8 @@
 """A tiny IRC server for tests and local smoke runs: python -m tests.fake_ircd [port]
 
-Supports registration, JOIN/PART/PRIVMSG/NICK/QUIT/PING/TOPIC between connected
-clients. `inject(line)` sends a raw line to every client, for simulating other users.
+Supports registration (with a 005 line), JOIN/PART/PRIVMSG/NICK/QUIT/PING/TOPIC between
+connected clients, AWAY and WHOIS. `inject(line)` sends a raw line to every client, for
+simulating other users; `away[nick]` makes a nick (real or simulated) away.
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ class FakeIRCd:
         self.topics: dict[str, str] = {}
         self.received: list[str] = []
         self.q_accounts: dict[str, str] = {}  # QuakeNet-style Q accounts: name -> password
+        self.away: dict[str, str] = {}  # irc_lower(nick) -> away message
         self.server: asyncio.base_events.Server | None = None
 
     async def start(self, port: int = 0) -> int:
@@ -84,6 +86,8 @@ class FakeIRCd:
                 conn.send(f":{old} NICK :{conn.nick}")
         elif cmd == "USER":
             conn.send(f":{SERVER} 001 {conn.nick} :Welcome to the fake network {conn.nick}")
+            conn.send(f":{SERVER} 005 {conn.nick} PREFIX=(ov)@+ CHANMODES=beI,k,l,imnpst "
+                      ":are supported by this server")
         elif cmd == "PING":
             conn.send(f":{SERVER} PONG {SERVER} :{p[0]}")
         elif cmd == "JOIN":
@@ -118,8 +122,19 @@ class FakeIRCd:
                 recipients = self.channels.get(irc_lower(target), set()) - {conn}
             else:
                 recipients = {c for c in self.conns if irc_lower(c.nick) == irc_lower(target)}
+                if cmd == "PRIVMSG" and (away := self.away.get(irc_lower(target))):
+                    conn.send(f":{SERVER} 301 {conn.nick} {target} :{away}")
             for c in recipients:
                 c.send(f":{conn.prefix} {cmd} {target} :{text}")
+        elif cmd == "AWAY":
+            if p and p[0]:
+                self.away[irc_lower(conn.nick)] = p[0]
+                conn.send(f":{SERVER} 306 {conn.nick} :You have been marked as being away")
+            else:
+                self.away.pop(irc_lower(conn.nick), None)
+                conn.send(f":{SERVER} 305 {conn.nick} :You are no longer marked as being away")
+        elif cmd == "WHOIS":
+            self._whois(conn, p[-1])
         elif cmd == "QUIT":
             conn.writer.close()
 
@@ -146,6 +161,21 @@ class FakeIRCd:
                 reply("Username or password incorrect.")
         else:
             reply("Unknown command.")
+
+    def _whois(self, conn: Conn, nick: str) -> None:
+        key = irc_lower(nick)
+        user = next((c for c in self.conns if irc_lower(c.nick) == key), None)
+        if user is None and key not in self.away:
+            conn.send(f":{SERVER} 401 {conn.nick} {nick} :No such nick/channel")
+        else:
+            channels = " ".join(name for name, members in self.channels.items() if user in members)
+            conn.send(f":{SERVER} 311 {conn.nick} {nick} {nick} localhost * :Fake User")
+            conn.send(f":{SERVER} 319 {conn.nick} {nick} :{channels}")
+            conn.send(f":{SERVER} 312 {conn.nick} {nick} {SERVER} :Fake IRC server")
+            if away := self.away.get(key):
+                conn.send(f":{SERVER} 301 {conn.nick} {nick} :{away}")
+            conn.send(f":{SERVER} 317 {conn.nick} {nick} 125 1700000000 :seconds idle, signon")
+        conn.send(f":{SERVER} 318 {conn.nick} {nick} :End of /WHOIS list.")
 
     def _maybe_hide(self, conn: Conn) -> None:
         if conn.wants_x and conn.account:

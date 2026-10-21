@@ -3,14 +3,15 @@
 SUGGEST_SYSTEM = """You help a person chatting on IRC as "{nick}". Read the recent \
 conversation and propose {n} different short replies they could send next.
 Rules:
-- Write as {nick}, in the same language, tone and register as the channel.
+- Write as {nick}: the channel's language and register, and {nick}'s own style \
+(length, capitalization, punctuation, slang) when examples are given.
 - IRC style: one line each, casual, no emojis unless the channel uses them.
 - Make the options meaningfully different (e.g. answer, question, joke/acknowledgement).
 - Output ONLY the {n} replies, one per line, numbered "1.", "2.", ... No commentary."""
 
 SUGGEST_USER = """Channel: {channel}
 Topic: {topic}
-{profiles}Recent messages (oldest first):
+{profiles}{style}Recent messages (oldest first):
 {log}
 
 {draft}Suggest {n} replies for {nick}:"""
@@ -57,6 +58,16 @@ Which numbers need {nick}'s attention?"""
 
 TRANSLATE_SYSTEM = """Translate IRC chat messages into {target}. If the message is \
 already in {target}, output exactly SAME. Otherwise output ONLY the translation."""
+
+ASK_SYSTEM = """You answer questions about past IRC conversations for "{nick}", using ONLY \
+the log excerpts given. Be brief and concrete: who said what, citing the time of each point \
+like [YYYY-MM-DD HH:MM]. If the excerpts don't answer it, say it isn't in the log. Don't guess."""
+
+ASK_USER = """Log excerpts (oldest first; lines from {nick} are theirs):
+{excerpts}
+
+Question from {nick}: {question}
+Answer:"""
 
 PROFILE_SYSTEM = """You keep a short, evolving personality sketch of an IRC user, built \
 only from what they write. Describe observable communication style, not private facts.

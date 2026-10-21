@@ -1,7 +1,7 @@
 import pytest
 
 from llm_irc.irc import message as m
-from llm_irc.irc.state import ChannelState, irc_lower
+from llm_irc.irc.state import ChannelState, ConnectionState, irc_lower
 
 
 def test_parse_privmsg_with_prefix_and_trailing():
@@ -76,3 +76,44 @@ def test_names_replace_member_list():
     chan.names_end()
     assert [n for n, _ in chan.sorted_members()] == ["op", "voice", "other", "plain"]
     assert not chan.has("old")
+
+
+
+def test_names_keep_every_prefix_and_show_the_highest():
+    chan = ChannelState("#c")
+    chan.names_chunk("+@both plain")
+    chan.names_end()
+    assert chan.members["both"] == ("both", "@+")
+    assert chan.sorted_members() == [("both", "@"), ("plain", "")]
+
+
+def test_set_prefix_keeps_other_prefixes():
+    chan = ChannelState("#c")
+    chan.add("bob")
+    assert chan.set_prefix("Bob", "+", True)
+    assert chan.set_prefix("bob", "@", True)
+    assert chan.members["bob"][1] == "@+"
+    chan.set_prefix("bob", "@", False)
+    assert chan.sorted_members() == [("bob", "+")]
+    assert not chan.set_prefix("ghost", "@", True)
+
+
+def test_parse_modes():
+    state = ConnectionState()
+    assert state.parse_modes("+o", ["alice"]) == [("+o", "alice")]
+    assert state.parse_modes("+ov-l", ["a", "b"]) == [("+o", "a"), ("+v", "b"), ("-l", None)]
+    assert state.parse_modes("+lo", ["10", "bob"]) == [("+l", "10"), ("+o", "bob")]
+    assert state.parse_modes("+b-k", ["*!*@spam", "*"]) == [("+b", "*!*@spam"), ("-k", "*")]
+    assert state.parse_modes("+imnt", []) == [("+i", None), ("+m", None), ("+n", None),
+                                              ("+t", None)]
+    assert state.parse_modes("+Ro", ["bob"]) == [("+R", None), ("+o", "bob")]  # unknown: no arg
+    assert state.parse_modes("+oo", ["bob"]) == [("+o", "bob"), ("+o", None)]
+
+
+def test_isupport_changes_prefixes_and_mode_args():
+    state = ConnectionState()
+    state.isupport(["PREFIX=(ov)@+", "CHANMODES=b,k,l,imnst", "NETWORK=Fake", "PREFIX=bogus"])
+    assert (state.prefix_modes, state.prefix_chars) == ("ov", "@+")
+    assert state.prefix_char("o") == "@" and state.prefix_char("h") is None
+    assert state.parse_modes("+h", ["x"]) == [("+h", None)]
+    assert state.ensure_channel("#c").prefixes == "@+"

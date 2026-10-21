@@ -90,6 +90,19 @@ class ChatBuffer(TabPane):
     def write_error(self, text: str) -> None:
         self.write_info(f"! {text}", style="bold red")
 
+    def write_found(self, ts: float, where: str, nick: str, text: str, kind: str,
+                    words: list[str]) -> None:
+        """A search hit: full date, the tab it came from, matched words highlighted."""
+        line = Text(time.strftime("%Y-%m-%d %H:%M ", time.localtime(ts)), style="dim")
+        if where:
+            line.append(f"{where} ", style="dim italic")
+        body = Text(text, style="italic" if kind == "action" else "")
+        body.highlight_words(words, "bold reverse", case_sensitive=False)
+        frame = {"action": "* {} ", "notice": "-{}- "}.get(kind, "<{}> ")
+        line.append(frame.format(nick), style=nick_style(nick))
+        line.append_text(body)
+        self.log_view.write(line)
+
     def write_note(self, text: str, style: str = "italic #8a9bb0") -> None:
         """Indented annotation for the line above (translations, triage)."""
         self.log_view.write(Text(f"      ↳ {text}", style=style))
