@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS profiles (
 );
 """
 
+# Schema history, applied in order and tracked in PRAGMA user_version. Never edit a
+# released step; append a new one. A step is SQL, or a function of the connection
+# returning SQL. Step 1's IF NOT EXISTS lets databases from before versioning pass.
+MIGRATIONS: list = [
+    SCHEMA,
+]
+
 
 @dataclass
 class StoredMessage:
@@ -63,14 +70,33 @@ class Profile:
     updated: float | None
 
 
+def _row(r: tuple) -> StoredMessage:
+    """A StoredMessage from `SELECT id, buffer, nick, text, kind, own, ts`."""
+    return StoredMessage(r[0], r[1], r[2], r[3], r[4], bool(r[5]), r[6])
+
+
 class Store:
     def __init__(self, path: str) -> None:
         self.db = sqlite3.connect(path)
         # WAL + NORMAL: one commit per chat line without an fsync stall each time.
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
-        self.db.executescript(SCHEMA)
-        self.db.commit()
+        try:
+            self._migrate()
+        except sqlite3.Error:
+            self.db.close()
+            raise
+
+    def _migrate(self) -> None:
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        for number, step in enumerate(MIGRATIONS[version:], version + 1):
+            script = step(self.db) if callable(step) else step
+            try:
+                self.db.executescript(f"BEGIN IMMEDIATE;\n{script}\n"
+                                      f"PRAGMA user_version = {number};\nCOMMIT;")
+            except sqlite3.Error:
+                self.db.rollback()  # executescript leaves the failed transaction open
+                raise
 
     def close(self) -> None:
         self.db.close()
@@ -93,8 +119,7 @@ class Store:
             "SELECT id, buffer, nick, text, kind, own, ts FROM messages "
             "WHERE network = ? AND buffer = ? AND id > ? ORDER BY id DESC LIMIT ?",
             (network, irc_lower(buffer), after_id, limit)).fetchall()
-        return [StoredMessage(r[0], r[1], r[2], r[3], r[4], bool(r[5]), r[6])
-                for r in reversed(rows)]
+        return [_row(r) for r in reversed(rows)]
 
     def messages_by(self, network: str, nick: str, limit: int) -> list[StoredMessage]:
         rows = self.db.execute(
@@ -102,8 +127,7 @@ class Store:
             "WHERE network = ? AND nick = ? COLLATE NOCASE AND own = 0 "
             "ORDER BY id DESC LIMIT ?",
             (network, nick, limit)).fetchall()
-        return [StoredMessage(r[0], r[1], r[2], r[3], r[4], bool(r[5]), r[6])
-                for r in reversed(rows)]
+        return [_row(r) for r in reversed(rows)]
 
     # --- read markers ---
 
