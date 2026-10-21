@@ -68,3 +68,7 @@ python -m pytest
 
 Includes an in-process fake IRC server (`tests/fake_ircd.py`, also runnable as
 `python -m tests.fake_ircd 6667` for manual testing with `tls = false`) and a fake LLM.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

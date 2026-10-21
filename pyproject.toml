@@ -3,6 +3,8 @@ name = "llm-irc"
 version = "0.1.0"
 description = "Terminal IRC client with a local LLM (LM Studio) that suggests replies"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["textual>=1.0", "openai>=1.0"]
 
 [project.optional-dependencies]
@@ -12,7 +14,7 @@ dev = ["pytest", "pytest-asyncio"]
 llm-irc = "llm_irc.__main__:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
